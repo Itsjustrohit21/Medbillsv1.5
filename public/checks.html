@@ -4,7 +4,7 @@
 <meta charset="UTF-8">
 <title>Review & Checks — CGHS Medical Bill Automation</title>
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<link rel="stylesheet" href="/styles.css?v=4">
+<link rel="stylesheet" href="/styles.css?v=5">
 </head>
 <body>
 <div class="app-shell">
@@ -232,25 +232,36 @@ function renderChecks() {
     const badgeCls = c.result==='PASS'?'badge-pass':c.result==='FAIL'?'badge-fail':c.result==='CONDITIONAL'?'badge-cond':'badge-pend';
     const card = document.createElement('div');
     card.className = 'check-card';
-    // OM box with open button (skip entire box for structural / non-OM checks)
-    const isStructural = !c.om_pdf && /^structural/i.test(c.om_ref || '');
-    const omBtn = c.om_pdf
-      ? `<button class="om-open-btn" onclick="openOM('${c.om_pdf}', '${esc(c.om_ref)}', '${esc(c.om_page||'')}')">📄 Open OM PDF</button>`
-      : '';
+    // OM box rendering — three cases:
+    // (1) Structural/internal check (no OM applicable) → grey info box, no button
+    // (2) OM cited AND PDF bundled → blue box with "Open OM PDF" button
+    // (3) OM cited but no PDF bundled → blue box, no misleading "not bundled" line
+    const isStructural = !c.om_pdf && /^(structural|internal)/i.test(c.om_ref || '');
     const pageChip = c.om_page ? `<span class="om-page-chip">${esc(c.om_page)}</span>` : '';
-    const omBoxHtml = isStructural
-      ? `<div class="om-box" style="border-left-color:var(--grey-500);">
-           <div class="om-box-top"><span class="om-ref-label" style="color:var(--grey-700);">ℹ️ ${esc(c.om_ref)}</span></div>
-           <div class="om-excerpt-text">${esc(c.om_excerpt)}</div>
-         </div>`
-      : `<div class="om-box">
-           <div class="om-box-top">
-             <span class="om-ref-label">📚 ${esc(c.om_ref)}</span>
-             ${pageChip}
-           </div>
-           <div class="om-excerpt-text">${esc(c.om_excerpt)}</div>
-           ${omBtn || '<span class="text-muted text-small">Reference document not bundled in app</span>'}
-         </div>`;
+    let omBoxHtml;
+    if (isStructural) {
+      omBoxHtml = `<div class="om-box" style="border-left-color:var(--grey-500);">
+        <div class="om-box-top"><span class="om-ref-label" style="color:var(--grey-700);">ℹ️ ${esc(c.om_ref)}</span></div>
+        <div class="om-excerpt-text">${esc(c.om_excerpt)}</div>
+      </div>`;
+    } else if (c.om_pdf) {
+      omBoxHtml = `<div class="om-box">
+        <div class="om-box-top">
+          <span class="om-ref-label">📚 ${esc(c.om_ref)}</span>
+          ${pageChip}
+        </div>
+        <div class="om-excerpt-text">${esc(c.om_excerpt)}</div>
+        <button class="om-open-btn" onclick="openOM('${c.om_pdf}', '${esc(c.om_ref)}', '${esc(c.om_page||'')}')">📄 Open OM PDF</button>
+      </div>`;
+    } else {
+      omBoxHtml = `<div class="om-box">
+        <div class="om-box-top">
+          <span class="om-ref-label">📚 ${esc(c.om_ref)}</span>
+          ${pageChip}
+        </div>
+        <div class="om-excerpt-text">${esc(c.om_excerpt)}</div>
+      </div>`;
+    }
     const sources = (c.source_refs||[]).map(s=>`<span class="source-chip">📎 ${SLOT_LABELS[s.slot]||s.slot}${s.label?` — ${esc(s.label)}`:''}</span>`).join('');
 
     // CHK-3 rate table with dual-source citation (2024 vs 2025)

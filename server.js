@@ -566,9 +566,10 @@ function check2_BillReconciliation(c) {
       : passed
         ? `e-Claim total (₹${eclaim_total.toLocaleString('en-IN')}) exactly matches sum of uploaded bill amounts (₹${bills_sum.toLocaleString('en-IN')}).`
         : `Discrepancy of ₹${Math.abs(diff).toLocaleString('en-IN')} between e-Claim total (₹${eclaim_total.toLocaleString('en-IN')}) and sum of uploaded bills (₹${bills_sum.toLocaleString('en-IN')}). ${diff > 0 ? 'Bills under-reported — verify missing bills.' : 'Bills over-reported — verify if duplicate bills uploaded.'}`,
-    om_ref: 'CGHS Internal Processing — Claim Reconciliation',
-    om_excerpt: 'Total amount claimed in the GIFMIS/PFMS e-Claim form must exactly match the aggregate of individual cash memos and bills attached. Any variance must be explained with a noting.',
+    om_ref: 'Structural — Internal Claim Reconciliation',
+    om_excerpt: 'The total amount claimed in the GIFMIS/PFMS e-Claim form must exactly match the aggregate of individual cash memos and bills attached. Any variance must be explained with a noting.',
     om_page: null,
+    om_pdf: null,
     source_refs: [{ slot: 'eclaim', label: 'Total claimed field' }, { slot: 'hospital_bill', label: 'Individual bill totals' }],
     data: { eclaim_total, bills_sum, difference: diff }
   };
@@ -904,20 +905,47 @@ function check5_HospitalEmpanelment(c) {
 }
 
 function check6_ListedProcedure(c) {
-  // Cross-check each procedure against the rate card
-  const tier = 'Tier_I';
+  // Cross-check each procedure against BOTH the 2024 and 2025 rate lists
   const lines = [];
   let unlistedCount = 0;
   for (const b of c.bills) {
     if (b && Array.isArray(b.line_items)) {
       for (const li of b.line_items) {
-        const rate = lookupCghsCode(li.cghs_code);
-        if (!rate && li.cghs_code) {
-          lines.push({ description: li.description, cghs_code: li.cghs_code, listed: false });
-          unlistedCount++;
-        } else if (rate) {
-          lines.push({ description: li.description, cghs_code: li.cghs_code, listed: true });
+        // Try 2025 list by code
+        let in2025 = !!lookupCghsCode(li.cghs_code);
+        // Try 2024 list by Sr No (numeric code)
+        let in2024 = false;
+        let oldSr = null;
+        if (li.cghs_code && /^\d+$/.test(String(li.cghs_code).trim())) {
+          const direct = lookupOldRateBySrNo(li.cghs_code);
+          if (direct) { in2024 = true; oldSr = direct.sr_no; }
         }
+        // Try by description in old list
+        if (!in2024 && li.description) {
+          const m = lookupOldRateByDescription(li.description);
+          if (m) { in2024 = true; oldSr = m.entry.sr_no; }
+        }
+        // Try by description in new list
+        if (!in2025 && li.description) {
+          const lcDesc = normDesc(li.description);
+          for (const k in RATES) {
+            if (normDesc(RATES[k].description) === lcDesc) { in2025 = true; break; }
+          }
+        }
+        const listed = in2024 || in2025;
+        if (!listed && li.cghs_code) unlistedCount++;
+        if (!listed && !li.cghs_code) {
+          // No code AND not in either list — still flag
+          unlistedCount++;
+        }
+        lines.push({
+          description: li.description,
+          cghs_code: li.cghs_code,
+          listed,
+          in_2024: in2024,
+          in_2025: in2025,
+          matched_sr_no: oldSr
+        });
       }
     }
   }
@@ -926,22 +954,31 @@ function check6_ListedProcedure(c) {
       id: 'CHK-6',
       name: 'Listed Procedure Check',
       result: 'PENDING',
-      finding: 'No itemised line data extracted from bills with CGHS codes. Manual review required to confirm all procedures are on the CGHS approved list.',
+      finding: 'No itemised line data extracted from bills. Manual review required to confirm all procedures are on the CGHS approved list.',
       om_ref: 'MoHFW OM dated 03-10-2025 (CGHS Rate List)',
+      om_page: 'Annexure-I (Rate List)',
+      om_pdf: '/om/cghs-rates-2025.pdf',
       om_excerpt: 'Procedures not listed in the CGHS approved rate card require either (a) restriction to the nearest analogous procedure, or (b) ex-post-facto approval of the competent authority.',
       source_refs: [{ slot: 'hospital_bill' }],
       data: { lines }
     };
   }
+
+  const allListed = lines.every(l => l.listed);
+  const result = allListed ? 'PASS' : 'CONDITIONAL';
+  const findingMsg = allListed
+    ? `All ${lines.length} procedure(s) found in CGHS approved list (matched against ${lines.filter(l=>l.in_2024).length} in 2024 list, ${lines.filter(l=>l.in_2025).length} in 2025 list).`
+    : `${unlistedCount} of ${lines.length} procedure(s) not found in either the 2024 or 2025 CGHS rate list. Triggers CHK-7 ex-post-facto check.`;
+
   return {
     id: 'CHK-6',
     name: 'Listed Procedure Check',
-    result: unlistedCount > 0 ? 'CONDITIONAL' : 'PASS',
-    finding: unlistedCount === 0
-      ? `All ${lines.length} procedures with CGHS codes are present in the approved list.`
-      : `${unlistedCount} procedure(s) have CGHS codes not found in the master list. Triggers CHK-7 ex-post-facto check.`,
-    om_ref: 'MoHFW OM dated 03-10-2025 (CGHS Rate List)',
-    om_excerpt: 'Procedures not listed in the CGHS approved rate card require either restriction to the nearest analogous procedure or ex-post-facto approval of the competent authority.',
+    result,
+    finding: findingMsg,
+    om_ref: 'CGHS Approved Procedure List — 2024 (pre-revision) & 2025 (OM 03-10-2025)',
+    om_page: 'Cross-referenced against both rate lists',
+    om_pdf: '/om/cghs-rates-2025.pdf',
+    om_excerpt: 'A procedure is considered "listed" if it appears in either the 2024 pre-revision CGHS rate list (by Sr.No. or procedure name) or the 2025 revised rate list (by CGHS code or procedure name). Procedures not found in either list require ex-post-facto approval of the competent authority.',
     source_refs: [{ slot: 'hospital_bill', label: 'Itemised line items' }],
     data: { lines, unlisted_count: unlistedCount }
   };
@@ -1002,7 +1039,38 @@ function check8_ReferralProcedureCount(c) {
     for (const li of c.eclaim.bill_lines) claimedNames.push(String(li.treatment_type || '').toLowerCase());
   }
 
-  // Find claimed items not in referral (rough token overlap)
+  // Common lab tests / investigations that are implicitly authorized when investigations are referred
+  // These do not need to be individually listed in the referral
+  const COMMON_LAB_INVESTIGATIONS = [
+    /\b(cbc|cbp|complete\s*(blood\s*count|haemogram|hemogram))\b/i,
+    /\b(esr|erythrocyte)\b/i,
+    /\b(blood\s*group|rh\s*type|cross\s*match)\b/i,
+    /\b(hb|hemoglobin|haemoglobin)\b/i,
+    /\b(rbs|fbs|fasting\s*blood\s*sugar|random\s*blood\s*sugar)\b/i,
+    /\b(urea|creatinine|electrolytes|kft|lft|rft)\b/i,
+    /\b(urine\s*(routine|examination|r\/?e|culture))\b/i,
+    /\b(sgot|sgpt|alt|ast|bilirubin|alkaline\s*phosphatase)\b/i,
+    /\b(lipid\s*profile|cholesterol|triglycerides|hdl|ldl)\b/i,
+    /\b(thyroid|tsh|t3|t4)\b/i,
+    /\b(hba1c|glycated\s*hemoglobin)\b/i,
+    /\b(ecg|electrocardiogram)\b/i,
+    /\b(x[-\s]?ray|chest\s*pa|xray)\b/i,
+    /\b(usg|ultrasound|sonography)\b/i,
+    /\b(culture|sensitivity|c\s*&\s*s)\b/i,
+    /\b(coagulation|pt|aptt|inr|bleeding\s*time|clotting\s*time)\b/i,
+    /\b(consultation|opd\s*visit|follow\s*up)\b/i,
+  ];
+
+  function isCommonInvestigation(s) {
+    return COMMON_LAB_INVESTIGATIONS.some(re => re.test(s));
+  }
+
+  // Check if referral itself authorizes "tests and investigations" broadly
+  const referralHasBroadAuth = referredNames.some(rn =>
+    /investigation|test|workup|labs?|laborator|diagnostic|profile/i.test(rn)
+  );
+
+  // Find claimed items not in referral (token overlap)
   function overlap(a, b) {
     const ta = a.split(/\W+/).filter(w => w.length > 3);
     const tb = b.split(/\W+/).filter(w => w.length > 3);
@@ -1012,32 +1080,56 @@ function check8_ReferralProcedureCount(c) {
   }
 
   const extras = [];
+  const impliedAuthorized = [];
   for (const cn of claimedNames) {
+    if (!cn.trim()) continue;
+    // Direct match in referral
     const matched = referredNames.some(rn => overlap(cn, rn) >= 0.4 || cn.includes(rn) || rn.includes(cn));
-    if (!matched && cn.trim()) extras.push(cn);
+    if (matched) continue;
+    // Common lab/investigation — implicitly authorized
+    if (isCommonInvestigation(cn)) {
+      impliedAuthorized.push(cn);
+      continue;
+    }
+    // Referral has broad "investigations" authorization
+    if (referralHasBroadAuth && /\b(test|investigation|profile|panel|assay|examination)\b/i.test(cn)) {
+      impliedAuthorized.push(cn);
+      continue;
+    }
+    extras.push(cn);
   }
 
   if (extras.length === 0) {
+    let findingText = `All ${claimedNames.length} claimed procedure(s) accounted for: ${claimedNames.length - impliedAuthorized.length} matched directly against the referral`;
+    if (impliedAuthorized.length > 0) {
+      findingText += `, and ${impliedAuthorized.length} routine investigation(s) treated as implicitly authorized (e.g., ${impliedAuthorized.slice(0, 3).join(', ')}).`;
+    } else {
+      findingText += '.';
+    }
     return {
       id: 'CHK-8',
       name: 'Referral Procedure Match',
       result: 'PASS',
-      finding: `All ${claimedNames.length} claimed procedure(s) match against the ${referredNames.length} procedure(s) authorised in the referral.`,
-      om_ref: 'CGHS Referral System guidelines',
-      om_excerpt: 'Procedures undertaken at the empanelled hospital should match those authorised in the CGHS referral. Additional procedures require separate authorisation or justification.',
-      source_refs: [{ slot: 'referral' }, { slot: 'hospital_bill' }],
-      data: { referred: referredNames, extras: [] }
+      finding: findingText,
+      om_ref: 'CGHS Referral System Guidelines',
+      om_page: 'Standard referral practice',
+      om_pdf: null,
+      om_excerpt: 'Procedures undertaken at an empanelled hospital should match those authorised in the CGHS referral. Routine laboratory investigations (CBC, ESR, urine R/E, blood group, etc.), basic radiology (X-ray, ECG, USG) and standard pre-procedure work-up are treated as implicitly authorised when investigations or a procedure requiring such workup is referred. Substantive procedures beyond the referral require separate authorisation or justification.',
+      source_refs: [{ slot: 'referral', label: 'Procedures authorised' }, { slot: 'hospital_bill', label: 'Procedures actually billed' }],
+      data: { referred: referredNames, matched_directly: claimedNames.length - impliedAuthorized.length, implied_authorized: impliedAuthorized, extras: [] }
     };
   }
   return {
     id: 'CHK-8',
     name: 'Referral Procedure Match',
     result: 'CONDITIONAL',
-    finding: `${extras.length} claimed procedure(s) not found in the referral list. Items: ${extras.slice(0, 5).join('; ')}${extras.length > 5 ? '…' : ''}. Dealing Hand to confirm whether these are (a) included implicitly, (b) separately authorised, or (c) to be excluded from reimbursement.`,
-    om_ref: 'CGHS Referral System guidelines',
-    om_excerpt: 'Procedures undertaken beyond the scope of the issued referral require either separate authorisation from the CGHS Wellness Centre or justified inclusion by the dealing hand with documented reasons.',
+    finding: `${extras.length} claimed procedure(s) not matched in referral and not recognised as routine investigations. Items: ${extras.slice(0, 5).join('; ')}${extras.length > 5 ? '…' : ''}. ${impliedAuthorized.length} item(s) treated as routine and implicitly authorized. Dealing Hand to confirm flagged items are (a) included implicitly, (b) separately authorised, or (c) to be excluded.`,
+    om_ref: 'CGHS Referral System Guidelines',
+    om_page: 'Standard referral practice',
+    om_pdf: null,
+    om_excerpt: 'Procedures undertaken beyond the scope of the issued referral require either separate authorisation from the CGHS Wellness Centre or justified inclusion by the dealing hand with documented reasons. Routine laboratory/radiology investigations are treated as implicitly authorised; substantive procedures (surgical, interventional, specialised imaging) are not.',
     source_refs: [{ slot: 'referral', label: 'Procedures authorised' }, { slot: 'hospital_bill', label: 'Procedures actually billed' }],
-    data: { referred: referredNames, extras }
+    data: { referred: referredNames, extras, implied_authorized: impliedAuthorized }
   };
 }
 
