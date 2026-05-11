@@ -1,0 +1,212 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Noting — CGHS Medical Bill Automation</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+<div class="app-shell">
+
+<header class="app-header">
+  <div class="app-header-left">
+    <div class="app-logo">🇮🇳</div>
+    <div class="app-title-block">
+      <div class="app-title">CGHS Medical Bill Automation</div>
+      <div class="app-subtitle">Department of Expenditure · Ministry of Finance</div>
+    </div>
+  </div>
+  <div class="app-header-right">
+    <div class="user-pill">Signed in as <b id="userName">…</b></div>
+    <a href="/checks" class="btn-ghost">← Back to Checks</a>
+    <button class="btn-ghost" id="logoutBtn">Sign out</button>
+  </div>
+</header>
+
+<nav class="stepper">
+  <div class="step done"><span class="step-num">✓</span> Sign in</div>
+  <div class="step done"><span class="step-num">✓</span> Upload Documents</div>
+  <div class="step done"><span class="step-num">✓</span> Review & Run Checks</div>
+  <div class="step active"><span class="step-num">4</span> Generate Noting</div>
+</nav>
+
+<main class="app-main">
+
+  <div class="noting-toolbar">
+    <button class="btn-ghost" id="copyBtn">📋 Copy noting text</button>
+    <button class="btn-ghost" id="downloadTableBtn">⬇ Download itemised table (PDF)</button>
+    <button class="btn-ghost" id="printBtn">🖨 Print</button>
+    <button class="btn-primary" onclick="window.location.href='/upload'">+ New claim</button>
+  </div>
+
+  <div class="noting-paper" id="notingPaper">
+    <div class="text-muted text-small text-right" id="fileNo">File No. _______</div>
+    <h2>Department of Expenditure</h2>
+    <h3 id="section">Admn. I</h3>
+    <div class="sep">*****</div>
+    <div class="subj">Subject: <span id="subj"></span></div>
+    <div id="paragraphs"></div>
+    <table class="noting-table" id="tableBox"></table>
+    <div class="text-small text-muted">In words: <span id="inWords"></span></div>
+
+    <div class="sanction-block" id="sanctionBlock"></div>
+  </div>
+
+</main>
+
+</div>
+
+<div class="toast-host" id="toasts"></div>
+
+<script>
+let userObj = null;
+let noting = null;
+
+async function loadUser() {
+  const r = await fetch('/api/me');
+  if (!r.ok) { window.location.href = '/login'; return; }
+  const data = await r.json();
+  userObj = data.user;
+  document.getElementById('userName').textContent = `${userObj.name} (${userObj.role})`;
+}
+
+document.getElementById('logoutBtn').addEventListener('click', async () => {
+  await fetch('/api/logout', { method: 'POST' });
+  window.location.href = '/login';
+});
+
+function escapeHtml(s) {
+  return String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+}
+function formatMd(s) {
+  return escapeHtml(s).replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>');
+}
+
+function render() {
+  document.getElementById('fileNo').textContent = `File No. ${noting.file_no}`;
+  document.getElementById('section').textContent = noting.section;
+  document.getElementById('subj').innerHTML = formatMd(noting.subject);
+
+  const para = document.getElementById('paragraphs');
+  para.innerHTML = noting.paragraphs.map((p, i) => `<p>${i === 0 ? '' : (i + '.&nbsp;&nbsp;')}${formatMd(p).replace(/^\d+\.\s*/, '')}</p>`).join('');
+
+  // Table
+  const tbl = document.getElementById('tableBox');
+  let tHtml = `<thead><tr><th style="width:40px;">S.No.</th><th>Description</th><th style="width:90px;">CGHS Code</th><th style="width:120px;">Amount Claimed (₹)</th><th style="width:130px;">Amount Admissible (₹)</th></tr></thead><tbody>`;
+  for (const r of noting.table) {
+    tHtml += `<tr>
+      <td>${r.sno}</td>
+      <td>${escapeHtml(r.description)}</td>
+      <td>${escapeHtml(r.cghs_code)}</td>
+      <td class="num">${Number(r.claimed).toLocaleString('en-IN')}</td>
+      <td class="num">${Number(r.admissible).toLocaleString('en-IN')}</td>
+    </tr>`;
+  }
+  tHtml += `</tbody><tfoot><tr class="noting-total">
+    <td colspan="3" style="text-align:right;">Grand Total</td>
+    <td class="num">${Number(noting.grand_total_claimed).toLocaleString('en-IN')}</td>
+    <td class="num">${Number(noting.grand_total_admissible).toLocaleString('en-IN')}</td>
+  </tr></tfoot>`;
+  tbl.innerHTML = tHtml;
+  document.getElementById('inWords').textContent = `Rupees ${noting.grand_total_admissible_in_words}`;
+  document.getElementById('sanctionBlock').textContent = noting.sanction_order;
+}
+
+document.getElementById('copyBtn').addEventListener('click', async () => {
+  // Build plain text version
+  const lines = [];
+  lines.push(`File No. ${noting.file_no}`);
+  lines.push('');
+  lines.push('                            Department of Expenditure');
+  lines.push(`                                  ${noting.section}`);
+  lines.push('                                    *****');
+  lines.push('');
+  lines.push('Subject: ' + noting.subject.replace(/\*\*/g, ''));
+  lines.push('');
+  noting.paragraphs.forEach((p, i) => {
+    const cleaned = p.replace(/\*\*/g, '');
+    lines.push((i === 0 ? '' : `${i}. `) + cleaned);
+    lines.push('');
+  });
+  // Table
+  lines.push('+------+-------------------------------+----------+----------------+----------------+');
+  lines.push('| S.No.| Description                   | CGHS Code| Claimed (₹)    | Admissible (₹) |');
+  lines.push('+------+-------------------------------+----------+----------------+----------------+');
+  for (const r of noting.table) {
+    lines.push('| ' + String(r.sno).padEnd(4) + ' | ' + (r.description || '').padEnd(29).slice(0, 29) + ' | ' + (r.cghs_code || '').padEnd(8).slice(0,8) + ' | ' + String(r.claimed.toLocaleString('en-IN')).padStart(14) + ' | ' + String(r.admissible.toLocaleString('en-IN')).padStart(14) + ' |');
+  }
+  lines.push('+------+-------------------------------+----------+----------------+----------------+');
+  lines.push('| Grand Total                                     | ' + String(noting.grand_total_claimed.toLocaleString('en-IN')).padStart(14) + ' | ' + String(noting.grand_total_admissible.toLocaleString('en-IN')).padStart(14) + ' |');
+  lines.push('+-------------------------------------------------+----------------+----------------+');
+  lines.push('');
+  lines.push('In words: Rupees ' + noting.grand_total_admissible_in_words);
+  lines.push('');
+  lines.push('---------- DRAFT SANCTION ORDER ----------');
+  lines.push('');
+  lines.push(noting.sanction_order);
+
+  try {
+    await navigator.clipboard.writeText(lines.join('\n'));
+    toast('Noting copied to clipboard.', 'ok');
+  } catch (e) {
+    // Fallback: select & copy
+    const ta = document.createElement('textarea');
+    ta.value = lines.join('\n');
+    document.body.appendChild(ta);
+    ta.select();
+    document.execCommand('copy');
+    ta.remove();
+    toast('Copied (fallback).', 'ok');
+  }
+});
+
+document.getElementById('downloadTableBtn').addEventListener('click', async () => {
+  toast('Generating PDF…');
+  const r = await fetch('/api/noting/pdf-table', { method: 'POST' });
+  if (!r.ok) { toast('PDF generation failed.', 'err'); return; }
+  const blob = await r.blob();
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url; a.download = 'cghs_claim_table.pdf';
+  document.body.appendChild(a);
+  a.click();
+  setTimeout(() => { URL.revokeObjectURL(url); a.remove(); }, 1000);
+});
+
+document.getElementById('printBtn').addEventListener('click', () => window.print());
+
+function toast(msg, kind) {
+  const host = document.getElementById('toasts');
+  const t = document.createElement('div');
+  t.className = 'toast' + (kind === 'err' ? ' toast-err' : kind === 'ok' ? ' toast-ok' : '');
+  t.textContent = msg;
+  host.appendChild(t);
+  setTimeout(() => t.remove(), 3500);
+}
+
+(async function init() {
+  await loadUser();
+  const r = await fetch('/api/claim');
+  if (!r.ok) { window.location.href = '/upload'; return; }
+  const data = await r.json();
+  if (!data.noting) {
+    // Need to generate — go back
+    toast('Noting not yet generated; redirecting back to checks.', 'err');
+    setTimeout(() => window.location.href = '/checks', 1200);
+    return;
+  }
+  noting = data.noting;
+  render();
+})();
+</script>
+
+<style>
+@media print {
+  .app-header, .stepper, .noting-toolbar, .toast-host { display: none !important; }
+  .app-shell, .app-main { padding: 0 !important; }
+  .noting-paper { box-shadow: none !important; border: 0 !important; padding: 20px !important; }
+}
+</style>
+</body>
+</html>

@@ -1,0 +1,265 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Document Upload — CGHS Medical Bill Automation</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+<div class="app-shell">
+
+<header class="app-header">
+  <div class="app-header-left">
+    <div class="app-logo">🇮🇳</div>
+    <div class="app-title-block">
+      <div class="app-title">CGHS Medical Bill Automation</div>
+      <div class="app-subtitle">Department of Expenditure · Ministry of Finance</div>
+    </div>
+  </div>
+  <div class="app-header-right">
+    <div class="user-pill">Signed in as <b id="userName">…</b></div>
+    <button class="btn-ghost" id="logoutBtn">Sign out</button>
+  </div>
+</header>
+
+<nav class="stepper">
+  <div class="step done"><span class="step-num">✓</span> Sign in</div>
+  <div class="step active"><span class="step-num">2</span> Upload Documents</div>
+  <div class="step"><span class="step-num">3</span> Review & Run Checks</div>
+  <div class="step"><span class="step-num">4</span> Generate Noting</div>
+</nav>
+
+<main class="app-main">
+  <h1 class="page-title">Upload claim documents</h1>
+  <p class="page-sub">Drop the relevant documents into each tile. The system validates that you're uploading the right document type into the right slot. <b>None of these are mandatory</b> — proceed with whatever you have.</p>
+
+  <div class="upload-grid" id="uploadGrid">
+    <!-- Tiles injected by JS -->
+  </div>
+
+  <div class="action-bar">
+    <div class="info" id="actionInfo">No files uploaded yet.</div>
+    <button class="btn-ghost" id="resetBtn">Reset</button>
+    <button class="btn-primary" id="proceedBtn">Proceed to OCR & Checks →</button>
+  </div>
+</main>
+
+</div>
+
+<!-- Modal viewer -->
+<div class="modal-overlay hidden" id="viewer">
+  <div class="modal-box">
+    <div class="modal-head">
+      <div id="viewerTitle">Document</div>
+      <button class="modal-close" onclick="document.getElementById('viewer').classList.add('hidden')">×</button>
+    </div>
+    <div class="modal-body" id="viewerBody"></div>
+  </div>
+</div>
+
+<div class="toast-host" id="toasts"></div>
+
+<script>
+const SLOTS = [
+  { key: 'eclaim',        icon: '📄', name: 'e-Claim Form',   desc: 'GIFMIS / PFMS RPR-23 e-Claim printout (the form generated when the beneficiary submits the claim).' },
+  { key: 'referral',      icon: '📝', name: 'CGHS Referral',  desc: 'Referral slip from CGHS Wellness Centre listing procedures the beneficiary is allowed to undergo.' },
+  { key: 'hospital_bill', icon: '🧾', name: 'Hospital Bills', desc: 'Bills, cash memos, invoices, discharge summary from the empanelled hospital. Multiple files allowed.' },
+  { key: 'cghs_card',     icon: '🆔', name: 'CGHS Card',      desc: 'Beneficiary card establishing CGHS enrolment & ward entitlement of the patient/principal.' },
+  { key: 'payment_proof', icon: '💳', name: 'Payment Proof',  desc: 'Receipts, bank statement, UPI/NEFT confirmation if the claimant paid the hospital directly.' },
+];
+
+let userObj = null;
+
+// Load user
+async function loadUser() {
+  try {
+    const r = await fetch('/api/me');
+    if (!r.ok) { window.location.href = '/login'; return; }
+    const data = await r.json();
+    userObj = data.user;
+    document.getElementById('userName').textContent = `${userObj.name} (${userObj.role})`;
+  } catch (e) { window.location.href = '/login'; }
+}
+
+document.getElementById('logoutBtn').addEventListener('click', async () => {
+  await fetch('/api/logout', { method: 'POST' });
+  window.location.href = '/login';
+});
+
+// Render tiles
+function renderTiles() {
+  const grid = document.getElementById('uploadGrid');
+  grid.innerHTML = '';
+  for (const s of SLOTS) {
+    const tile = document.createElement('div');
+    tile.className = 'upload-tile';
+    tile.id = `tile-${s.key}`;
+    tile.innerHTML = `
+      <div class="tile-header">
+        <div class="tile-icon">${s.icon}</div>
+        <div class="tile-name">${s.name}</div>
+      </div>
+      <div class="tile-desc">${s.desc}</div>
+      <div class="tile-input-row">
+        <input type="file" id="file-${s.key}" accept=".pdf,.png,.jpg,.jpeg" ${s.key === 'hospital_bill' ? 'multiple' : ''}>
+        <button class="btn-ghost" data-slot="${s.key}" onclick="uploadSlot('${s.key}')">Upload</button>
+      </div>
+      <div class="tile-files" id="files-${s.key}"></div>
+      <div class="tile-validation hidden" id="val-${s.key}"></div>
+    `;
+    grid.appendChild(tile);
+  }
+}
+
+// Track uploaded files in client state too (for UI)
+const uploaded = {};
+SLOTS.forEach(s => uploaded[s.key] = []);
+
+async function uploadSlot(slot) {
+  const input = document.getElementById(`file-${slot}`);
+  const files = input.files;
+  if (!files || files.length === 0) { toast('Choose a file first.', 'err'); return; }
+  const fd = new FormData();
+  for (const f of files) fd.append('files', f);
+
+  toast(`Uploading ${files.length} file(s)…`);
+  const r = await fetch(`/api/upload/${slot}`, { method: 'POST', body: fd });
+  if (!r.ok) {
+    const err = await r.json().catch(() => ({}));
+    toast(err.error || 'Upload failed.', 'err'); return;
+  }
+  const data = await r.json();
+  for (const f of data.files) uploaded[slot].push(f);
+  input.value = '';
+  renderFiles(slot);
+  validateSlot(slot, data.files);
+  updateInfo();
+}
+
+function renderFiles(slot) {
+  const list = document.getElementById(`files-${slot}`);
+  const tile = document.getElementById(`tile-${slot}`);
+  list.innerHTML = '';
+  if (uploaded[slot].length === 0) {
+    tile.classList.remove('has-files');
+    return;
+  }
+  tile.classList.add('has-files');
+  for (const f of uploaded[slot]) {
+    const row = document.createElement('div');
+    row.className = 'tile-file';
+    const sizeKB = (f.size / 1024).toFixed(0);
+    row.innerHTML = `
+      <span>📎</span>
+      <span class="file-name" title="${escapeHtml(f.filename)}">${escapeHtml(f.filename)}</span>
+      <span class="file-size">${sizeKB} KB</span>
+      <a href="/api/file/${f.id}" target="_blank" title="View">👁</a>
+      <button class="btn-danger" onclick="removeFile('${slot}', '${f.id}')">Remove</button>
+    `;
+    list.appendChild(row);
+  }
+}
+
+async function removeFile(slot, fileId) {
+  await fetch(`/api/file/${fileId}`, { method: 'DELETE' });
+  uploaded[slot] = uploaded[slot].filter(f => f.id !== fileId);
+  renderFiles(slot);
+  document.getElementById(`val-${slot}`).classList.add('hidden');
+  updateInfo();
+}
+
+async function validateSlot(slot, files) {
+  const valDiv = document.getElementById(`val-${slot}`);
+  valDiv.classList.remove('hidden');
+  valDiv.className = 'tile-validation val-pending';
+  valDiv.innerHTML = `<span class="spinner" style="border-color: rgba(0,0,0,0.2); border-top-color: #003a8c;"></span> Validating document type…`;
+
+  const results = [];
+  for (const f of files) {
+    try {
+      const r = await fetch(`/api/validate-slot/${slot}/${f.id}`, { method: 'POST' });
+      const data = await r.json();
+      results.push({ file: f, ...data });
+    } catch (e) {
+      results.push({ file: f, matches: true, confidence: 'low', reason: 'Validation failed: ' + e.message });
+    }
+  }
+
+  // Render summary
+  const allMatch = results.every(r => r.matches);
+  const anyLow = results.some(r => r.confidence === 'low');
+  if (allMatch) {
+    valDiv.className = 'tile-validation val-pass';
+    valDiv.innerHTML = `✅ Document type confirmed. <span class="text-muted">${results.map(r => r.reason || '').join(' · ')}</span>`;
+  } else {
+    valDiv.className = 'tile-validation val-warn';
+    const mismatches = results.filter(r => !r.matches).map(r => `<b>${escapeHtml(r.file.filename)}</b> appears to be a <b>${r.detected_type || 'different'}</b> document. ${r.reason || ''}`);
+    valDiv.innerHTML = `⚠️ ${mismatches.join('<br>')} <br><span class="text-muted">You can still proceed if this is intentional.</span>`;
+  }
+}
+
+function updateInfo() {
+  const total = Object.values(uploaded).reduce((a, b) => a + b.length, 0);
+  const slots = Object.entries(uploaded).filter(([, v]) => v.length > 0).length;
+  document.getElementById('actionInfo').textContent =
+    total === 0
+      ? 'No files uploaded yet.'
+      : `${total} file(s) across ${slots} document type(s) — ready to extract.`;
+}
+
+document.getElementById('proceedBtn').addEventListener('click', async () => {
+  const total = Object.values(uploaded).reduce((a, b) => a + b.length, 0);
+  if (total === 0) {
+    if (!confirm('No documents uploaded. Proceed anyway? (Most checks will be PENDING.)')) return;
+  }
+  const btn = document.getElementById('proceedBtn');
+  btn.disabled = true; btn.innerHTML = '<span class="spinner"></span> Running OCR…';
+  try {
+    const r = await fetch('/api/extract', { method: 'POST' });
+    if (!r.ok) {
+      const err = await r.json().catch(() => ({}));
+      toast(err.error || 'Extraction failed.', 'err');
+      btn.disabled = false; btn.textContent = 'Proceed to OCR & Checks →';
+      return;
+    }
+    window.location.href = '/checks';
+  } catch (e) {
+    toast('Network error: ' + e.message, 'err');
+    btn.disabled = false; btn.textContent = 'Proceed to OCR & Checks →';
+  }
+});
+
+document.getElementById('resetBtn').addEventListener('click', async () => {
+  if (!confirm('Remove all uploaded files?')) return;
+  for (const slot of SLOTS) {
+    for (const f of uploaded[slot.key]) {
+      await fetch(`/api/file/${f.id}`, { method: 'DELETE' });
+    }
+    uploaded[slot.key] = [];
+    renderFiles(slot.key);
+    document.getElementById(`val-${slot.key}`).classList.add('hidden');
+  }
+  updateInfo();
+});
+
+function escapeHtml(s) {
+  return String(s || '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+}
+function toast(msg, kind) {
+  const host = document.getElementById('toasts');
+  const t = document.createElement('div');
+  t.className = 'toast' + (kind === 'err' ? ' toast-err' : kind === 'ok' ? ' toast-ok' : '');
+  t.textContent = msg;
+  host.appendChild(t);
+  setTimeout(() => t.remove(), 3500);
+}
+
+(async function init() {
+  await loadUser();
+  renderTiles();
+  updateInfo();
+})();
+</script>
+</body>
+</html>

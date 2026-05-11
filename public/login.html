@@ -1,0 +1,83 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>CGHS Medical Bill Automation — Login</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="stylesheet" href="/styles.css">
+</head>
+<body class="auth-bg">
+<div class="auth-shell">
+  <div class="auth-card">
+    <div class="auth-header">
+      <div class="auth-emblem">🇮🇳</div>
+      <div class="auth-title">
+        <div class="auth-line1">Government of India</div>
+        <div class="auth-line2">Ministry of Finance</div>
+        <div class="auth-line3">Department of Expenditure</div>
+      </div>
+    </div>
+    <hr class="auth-divider">
+    <h1 class="auth-h1">CGHS Medical Bill Automation</h1>
+    <p class="auth-subtitle">Sign in to begin processing a medical reimbursement claim.</p>
+
+    <form id="loginForm" class="auth-form" autocomplete="off">
+      <label>
+        <span>Username</span>
+        <input type="text" name="username" id="username" required autofocus placeholder="admin / so / us">
+      </label>
+      <label>
+        <span>Password</span>
+        <input type="password" name="password" id="password" required>
+      </label>
+      <button type="submit" class="btn-primary" id="loginBtn">Sign In</button>
+    </form>
+    <div id="msg" class="auth-msg"></div>
+
+    <div class="auth-creds">
+      <strong>Demo credentials</strong>
+      <div class="cred-grid">
+        <div><b>admin</b> / admin <span class="muted">— Dealing Hand</span></div>
+        <div><b>so</b> / so123 <span class="muted">— Section Officer</span></div>
+        <div><b>us</b> / us123 <span class="muted">— Under Secretary</span></div>
+      </div>
+    </div>
+  </div>
+  <div class="auth-foot">
+    POC v1.0 · For demonstration only · Built for the Department of Expenditure
+  </div>
+</div>
+
+<script>
+document.getElementById('loginForm').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const btn = document.getElementById('loginBtn');
+  const msg = document.getElementById('msg');
+  msg.textContent = ''; msg.className = 'auth-msg';
+  btn.disabled = true; btn.textContent = 'Signing in…';
+  try {
+    const r = await fetch('/api/login', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        username: document.getElementById('username').value.trim(),
+        password: document.getElementById('password').value
+      })
+    });
+    const data = await r.json();
+    if (!r.ok) {
+      msg.textContent = data.error || 'Login failed.';
+      msg.classList.add('auth-msg-err');
+      btn.disabled = false; btn.textContent = 'Sign In';
+      return;
+    }
+    window.location.href = '/upload';
+  } catch (err) {
+    msg.textContent = 'Network error: ' + err.message;
+    msg.classList.add('auth-msg-err');
+    btn.disabled = false; btn.textContent = 'Sign In';
+  }
+});
+</script>
+</body>
+</html>
