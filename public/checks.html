@@ -4,7 +4,7 @@
 <meta charset="UTF-8">
 <title>Review & Checks — CGHS Medical Bill Automation</title>
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<link rel="stylesheet" href="/styles.css">
+<link rel="stylesheet" href="/styles.css?v=4">
 </head>
 <body>
 <div class="app-shell">
@@ -19,7 +19,7 @@
   </div>
   <div class="app-header-right">
     <div class="user-pill">Signed in as <b id="userName">…</b></div>
-    <a href="/upload" class="btn-ghost">← Back to Upload</a>
+    <a href="/upload" class="btn-ghost">← Upload</a>
     <button class="btn-ghost" id="logoutBtn">Sign out</button>
   </div>
 </header>
@@ -27,33 +27,31 @@
 <nav class="stepper">
   <div class="step done"><span class="step-num">✓</span> Sign in</div>
   <div class="step done"><span class="step-num">✓</span> Upload Documents</div>
-  <div class="step active"><span class="step-num">3</span> Review & Run Checks</div>
+  <div class="step active"><span class="step-num">3</span> Review &amp; Checks</div>
   <div class="step"><span class="step-num">4</span> Generate Noting</div>
 </nav>
 
 <main class="app-main">
-
-  <!-- Tabs -->
-  <div class="check-tabs" id="tabs">
+  <div class="check-tabs">
     <button class="check-tab active" data-tab="extracted">📋 Extracted Data</button>
     <button class="check-tab" data-tab="checks">✓ 8 Compliance Checks</button>
   </div>
 
-  <!-- Extracted data tab -->
+  <!-- Tab: Extracted Data -->
   <div id="tab-extracted">
-    <h1 class="page-title">Review extracted data</h1>
-    <p class="page-sub">OCR results from each uploaded document. <b>Edit any field</b> if the extraction is incorrect — your edits will flow into the checks below.</p>
+    <h1 class="page-title" style="margin-top:16px;">Review extracted data</h1>
+    <p class="page-sub">OCR results from each uploaded document. <b>Edit any incorrect field</b> — your edits flow into the compliance checks.</p>
     <div id="extractedView"></div>
     <div class="action-bar">
-      <div class="info" id="extractedInfo"></div>
+      <div class="info" id="extractedInfo">Loading…</div>
       <button class="btn-primary" id="runChecksBtn">Run 8 Compliance Checks →</button>
     </div>
   </div>
 
-  <!-- Checks tab -->
+  <!-- Tab: Checks -->
   <div id="tab-checks" class="hidden">
-    <h1 class="page-title">Compliance checks</h1>
-    <p class="page-sub">Eight automated checks validate the claim against CGHS rules. Failed/conditional checks can be overridden with justification.</p>
+    <h1 class="page-title" style="margin-top:16px;">Compliance checks</h1>
+    <p class="page-sub">Eight automated checks against CGHS rules. FAIL / CONDITIONAL checks require justification before the noting can be generated.</p>
     <div id="checksView"></div>
     <div class="action-bar">
       <div class="info" id="checksInfo"></div>
@@ -61,50 +59,48 @@
       <button class="btn-primary" id="generateNotingBtn">Generate Noting →</button>
     </div>
   </div>
-
 </main>
 
 </div>
 
-<!-- Document viewer modal -->
-<div class="modal-overlay hidden" id="viewer">
+<!-- OM PDF viewer modal -->
+<div class="modal-overlay hidden" id="omViewer">
   <div class="modal-box">
     <div class="modal-head">
-      <div id="viewerTitle">Document</div>
-      <button class="modal-close" onclick="document.getElementById('viewer').classList.add('hidden')">×</button>
+      <div>
+        <div class="modal-head-title" id="omTitle">Office Memorandum</div>
+        <div class="modal-head-sub" id="omSub"></div>
+      </div>
+      <button class="modal-close" onclick="document.getElementById('omViewer').classList.add('hidden')">×</button>
     </div>
-    <div class="modal-body" id="viewerBody"></div>
+    <div class="modal-body"><iframe id="omFrame" src="" title="OM PDF"></iframe></div>
+  </div>
+</div>
+
+<!-- File viewer modal -->
+<div class="modal-overlay hidden" id="fileViewer">
+  <div class="modal-box">
+    <div class="modal-head">
+      <div class="modal-head-title" id="fileViewerTitle">Document</div>
+      <button class="modal-close" onclick="document.getElementById('fileViewer').classList.add('hidden')">×</button>
+    </div>
+    <div class="modal-body" id="fileViewerBody"></div>
   </div>
 </div>
 
 <div class="toast-host" id="toasts"></div>
 
 <script>
-let userObj = null;
-let extracted = {};
-let checks = [];
-let overrides = {};
-
-const SLOT_LABELS = {
-  eclaim: 'e-Claim Form',
-  referral: 'CGHS Referral',
-  hospital_bill: 'Hospital Bills',
-  cghs_card: 'CGHS Card',
-  payment_proof: 'Payment Proof'
-};
+const SLOT_LABELS = { eclaim:'e-Claim Form', referral:'CGHS Referral', hospital_bill:'Hospital Bills', cghs_card:'CGHS Card', payment_proof:'Payment Proof' };
+let extracted = {}, checks = [], overrides = {};
 
 async function loadUser() {
   const r = await fetch('/api/me');
   if (!r.ok) { window.location.href = '/login'; return; }
-  const data = await r.json();
-  userObj = data.user;
-  document.getElementById('userName').textContent = `${userObj.name} (${userObj.role})`;
+  const d = await r.json();
+  document.getElementById('userName').textContent = `${d.user.name} (${d.user.role})`;
 }
-
-document.getElementById('logoutBtn').addEventListener('click', async () => {
-  await fetch('/api/logout', { method: 'POST' });
-  window.location.href = '/login';
-});
+document.getElementById('logoutBtn').addEventListener('click', async () => { await fetch('/api/logout',{method:'POST'}); window.location.href='/login'; });
 
 // Tab switching
 document.querySelectorAll('.check-tab').forEach(t => t.addEventListener('click', () => {
@@ -114,261 +110,232 @@ document.querySelectorAll('.check-tab').forEach(t => t.addEventListener('click',
   document.getElementById('tab-checks').classList.toggle('hidden', t.dataset.tab !== 'checks');
 }));
 
-function escapeHtml(s) {
-  return String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+function esc(s) { return String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
+function fmtMd(s) { return esc(s).replace(/\*\*(.+?)\*\*/g,'<strong>$1</strong>'); }
+function toast(msg, kind) {
+  const t = document.createElement('div');
+  t.className='toast'+(kind==='err'?' toast-err':kind==='ok'?' toast-ok':'');
+  t.textContent=msg;
+  document.getElementById('toasts').appendChild(t);
+  setTimeout(()=>t.remove(),4000);
 }
 
-function fieldRow(label, value, key, type = 'text') {
-  const v = value == null ? '' : value;
-  return `<div class="field-row">
-    <label>${escapeHtml(label)}</label>
-    <input type="${type}" data-key="${escapeHtml(key)}" value="${escapeHtml(v)}">
-  </div>`;
+// Open OM PDF in modal
+function openOM(pdfPath, title, page) {
+  if (!pdfPath) { toast('OM PDF not available for this check.'); return; }
+  document.getElementById('omTitle').textContent = title || 'Office Memorandum';
+  document.getElementById('omSub').textContent = page ? `Reference: ${page}` : '';
+  document.getElementById('omFrame').src = pdfPath;
+  document.getElementById('omViewer').classList.remove('hidden');
 }
+
+// View uploaded file
+function viewFile(fileId, filename) {
+  document.getElementById('fileViewerTitle').textContent = filename;
+  const body = document.getElementById('fileViewerBody');
+  const ext = String(filename).toLowerCase().split('.').pop();
+  body.innerHTML = ext==='pdf'
+    ? `<iframe src="/api/file/${fileId}" type="application/pdf"></iframe>`
+    : `<img src="/api/file/${fileId}" alt="${esc(filename)}" style="max-width:100%;display:block;margin:auto;">`;
+  document.getElementById('fileViewer').classList.remove('hidden');
+}
+
+function prettyKey(k) { return String(k).replace(/_/g,' ').replace(/\b\w/g,c=>c.toUpperCase()); }
 
 function buildExtractedView() {
   const host = document.getElementById('extractedView');
   host.innerHTML = '';
-  let totalFiles = 0;
+  let total = 0;
   for (const slot of Object.keys(extracted)) {
     const docs = extracted[slot] || [];
-    if (docs.length === 0) continue;
-    totalFiles += docs.length;
-    for (let i = 0; i < docs.length; i++) {
+    for (let i=0; i<docs.length; i++) {
       const doc = docs[i];
+      total++;
+      const conf = doc.fields?._confidence || 'low';
+      const confCls = conf==='high'?'conf-high':conf==='low'?'conf-low':'conf-medium';
       const card = document.createElement('div');
       card.className = 'card';
-      const conf = doc.fields?._confidence || 'medium';
-      const confClass = conf === 'high' ? 'conf-high' : conf === 'low' ? 'conf-low' : 'conf-medium';
-      let bodyHtml = '';
-      if (doc.fields?._error) {
-        bodyHtml = `<div class="val-fail tile-validation">⚠️ Extraction error: ${escapeHtml(doc.fields._error)}. You can still enter values manually below.</div>`;
-      }
-
-      // Build form for this document
-      bodyHtml += '<div class="fields-grid" data-slot="' + slot + '" data-idx="' + i + '">';
+      const skip = new Set(['_error','_confidence','bill_lines','line_items','procedures_referred','supporting_documents']);
+      let body = '';
+      if (doc.fields?._error) body += `<div class="tile-validation val-fail" style="margin-bottom:10px;">⚠️ Extraction issue: ${esc(doc.fields._error)}</div>`;
+      body += `<div class="fields-grid" data-slot="${slot}" data-idx="${i}">`;
       const f = doc.fields || {};
-      const skipKeys = new Set(['_error', '_confidence', 'bill_lines', 'line_items', 'procedures_referred', 'supporting_documents']);
-
-      // Render scalar fields
-      for (const [k, v] of Object.entries(f)) {
-        if (skipKeys.has(k)) continue;
-        if (v && typeof v === 'object') continue;
-        bodyHtml += fieldRow(prettyKey(k), v, k);
+      for (const [k,v] of Object.entries(f)) {
+        if (skip.has(k) || (v && typeof v==='object')) continue;
+        body += `<div class="field-row"><label>${esc(prettyKey(k))}</label><input type="text" data-key="${esc(k)}" value="${esc(v??'')}"></div>`;
       }
-      bodyHtml += '</div>';
-
-      // Render bill_lines / line_items table (editable)
-      if (Array.isArray(f.bill_lines) && f.bill_lines.length > 0) {
-        bodyHtml += '<div class="card-title mt-12">Bill Lines (editable)</div>';
-        bodyHtml += renderEditableLineTable(f.bill_lines, slot, i, 'bill_lines',
-          ['treatment_type', 'from_date', 'to_date', 'amount', 'cghs_sr_no', 'cash_memo_no', 'issuing_authority']);
-      }
-      if (Array.isArray(f.line_items) && f.line_items.length > 0) {
-        bodyHtml += '<div class="card-title mt-12">Bill Line Items (editable)</div>';
-        bodyHtml += renderEditableLineTable(f.line_items, slot, i, 'line_items',
-          ['description', 'cghs_code', 'qty', 'rate', 'amount']);
-      }
-      if (Array.isArray(f.procedures_referred) && f.procedures_referred.length > 0) {
-        bodyHtml += '<div class="card-title mt-12">Procedures referred (editable)</div>';
-        bodyHtml += renderEditableLineTable(f.procedures_referred, slot, i, 'procedures_referred',
-          ['name', 'cghs_code']);
-      }
-
+      body += '</div>';
+      // Array sub-tables
+      if (Array.isArray(f.bill_lines) && f.bill_lines.length) body += buildSubTable(f.bill_lines, slot, i, 'bill_lines', ['treatment_type','from_date','to_date','amount','cghs_sr_no','cash_memo_no']);
+      if (Array.isArray(f.line_items) && f.line_items.length) body += buildSubTable(f.line_items, slot, i, 'line_items', ['description','cghs_code','qty','rate','amount']);
+      if (Array.isArray(f.procedures_referred) && f.procedures_referred.length) body += buildSubTable(f.procedures_referred, slot, i, 'procedures_referred', ['name','cghs_code']);
       card.innerHTML = `
         <div class="check-head">
-          <div>
-            <div class="check-id">${SLOT_LABELS[slot]}</div>
-            <div class="check-name">${escapeHtml(doc.filename)} <span class="confidence-tag ${confClass}">${conf} confidence</span></div>
+          <div class="check-head-left">
+            <div class="check-id">${SLOT_LABELS[slot]||slot}</div>
+            <div class="check-name">${esc(doc.filename)} <span class="confidence-tag ${confCls}">${conf} confidence</span></div>
           </div>
-          <button class="btn-ghost" onclick="viewFile('${doc.file_id}', ${JSON.stringify(doc.filename).replace(/"/g, '&quot;')})">👁 View source</button>
+          ${doc.file_id ? `<button class="btn-ghost" onclick="viewFile('${doc.file_id}', '${esc(doc.filename)}')">👁 View</button>` : ''}
         </div>
-        ${bodyHtml}
-      `;
+        ${body}`;
       host.appendChild(card);
     }
   }
-  if (totalFiles === 0) {
-    host.innerHTML = '<div class="card">No documents were uploaded. <a href="/upload">← Go back to upload</a></div>';
-  }
-  document.getElementById('extractedInfo').textContent = `${totalFiles} document(s) processed.`;
+  if (!total) host.innerHTML = '<div class="card">No documents were processed. <a href="/upload">← Go back to upload</a></div>';
+  document.getElementById('extractedInfo').textContent = `${total} document(s) processed. Edit any field before running checks.`;
 }
 
-function renderEditableLineTable(arr, slot, docIdx, listKey, cols) {
-  let html = `<table class="bill-table" data-slot="${slot}" data-idx="${docIdx}" data-list="${listKey}">
-    <thead><tr>${cols.map(c => `<th>${prettyKey(c)}</th>`).join('')}</tr></thead><tbody>`;
-  for (let r = 0; r < arr.length; r++) {
-    html += '<tr>';
-    for (const col of cols) {
-      const val = arr[r] && arr[r][col] != null ? arr[r][col] : '';
-      html += `<td><input style="width:100%;border:1px solid #c8d0d9;border-radius:4px;padding:3px 5px;font-size:12px;" data-row="${r}" data-col="${col}" value="${escapeHtml(val)}"></td>`;
-    }
-    html += '</tr>';
-  }
-  html += '</tbody></table>';
+function buildSubTable(arr, slot, idx, listKey, cols) {
+  let html = `<div class="card-title mt-12">${prettyKey(listKey)}</div>
+    <div style="overflow-x:auto;">
+    <table class="bill-table" data-slot="${slot}" data-idx="${idx}" data-list="${listKey}">
+      <thead><tr>${cols.map(c=>`<th>${esc(prettyKey(c))}</th>`).join('')}</tr></thead><tbody>`;
+  arr.forEach((r,ri) => {
+    html += '<tr>'+cols.map(c=>`<td><input style="width:100%;border:1px solid #c8d0d9;border-radius:4px;padding:3px 5px;font-size:11.5px;" data-row="${ri}" data-col="${esc(c)}" value="${esc(r&&r[c]!=null?r[c]:'')}" /></td>`).join('')+'</tr>';
+  });
+  html += '</tbody></table></div>';
   return html;
 }
 
-function prettyKey(k) {
-  return String(k).replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase());
-}
-
-// Collect edits back into extracted{}
 function collectEdits() {
-  document.querySelectorAll('.fields-grid').forEach(grid => {
-    const slot = grid.dataset.slot;
-    const idx = parseInt(grid.dataset.idx, 10);
+  document.querySelectorAll('.fields-grid').forEach(g => {
+    const slot=g.dataset.slot, idx=parseInt(g.dataset.idx);
     const target = extracted[slot]?.[idx]?.fields;
     if (!target) return;
-    grid.querySelectorAll('input').forEach(inp => {
-      const k = inp.dataset.key;
-      if (!k) return;
-      let v = inp.value.trim();
-      if (typeof target[k] === 'number' || /amount|total|pay|level/i.test(k)) {
-        const num = parseFloat(v.replace(/,/g, ''));
-        target[k] = isNaN(num) ? v : num;
-      } else {
-        target[k] = v;
-      }
+    g.querySelectorAll('input').forEach(inp => {
+      const k=inp.dataset.key; if (!k) return;
+      const v = inp.value.trim();
+      target[k] = /amount|total|pay|level|qty|rate/i.test(k) ? (isNaN(parseFloat(v))?v:parseFloat(v.replace(/,/g,''))) : v;
     });
   });
   document.querySelectorAll('.bill-table[data-list]').forEach(tbl => {
-    const slot = tbl.dataset.slot;
-    const idx = parseInt(tbl.dataset.idx, 10);
-    const listKey = tbl.dataset.list;
+    const slot=tbl.dataset.slot, idx=parseInt(tbl.dataset.idx), listKey=tbl.dataset.list;
     const arr = extracted[slot]?.[idx]?.fields?.[listKey];
     if (!Array.isArray(arr)) return;
-    tbl.querySelectorAll('tbody tr').forEach((tr, r) => {
+    tbl.querySelectorAll('tbody tr').forEach((tr,ri) => {
       tr.querySelectorAll('input').forEach(inp => {
-        const col = inp.dataset.col;
-        if (!arr[r]) arr[r] = {};
-        let v = inp.value.trim();
-        if (/amount|qty|rate/i.test(col)) {
-          const num = parseFloat(v.replace(/,/g, ''));
-          arr[r][col] = isNaN(num) ? v : num;
-        } else {
-          arr[r][col] = v;
-        }
+        const col=inp.dataset.col; if(!arr[ri]) arr[ri]={};
+        const v=inp.value.trim();
+        arr[ri][col] = /amount|qty|rate/i.test(col) ? (isNaN(parseFloat(v))?v:parseFloat(v.replace(/,/g,''))) : v;
       });
     });
   });
 }
 
-// View file
-async function viewFile(fileId, filename) {
-  document.getElementById('viewerTitle').textContent = filename;
-  const body = document.getElementById('viewerBody');
-  // Detect by extension
-  const ext = String(filename).toLowerCase().split('.').pop();
-  if (ext === 'pdf') {
-    body.innerHTML = `<iframe src="/api/file/${fileId}" type="application/pdf"></iframe>`;
-  } else {
-    body.innerHTML = `<img src="/api/file/${fileId}" alt="${escapeHtml(filename)}">`;
-  }
-  document.getElementById('viewer').classList.remove('hidden');
-}
-
-// Run checks
-async function runChecks() {
-  collectEdits();
-  const btn = document.getElementById('runChecksBtn');
-  btn.disabled = true; btn.innerHTML = '<span class="spinner"></span> Running…';
-  try {
-    const r = await fetch('/api/checks', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ extracted })
-    });
-    if (!r.ok) {
-      const err = await r.json().catch(() => ({}));
-      toast(err.error || 'Checks failed.', 'err');
-      btn.disabled = false; btn.textContent = 'Run 8 Compliance Checks →';
-      return;
-    }
-    const data = await r.json();
-    checks = data.checks;
-    renderChecks();
-    // Switch tab
-    document.querySelectorAll('.check-tab').forEach(x => x.classList.remove('active'));
-    document.querySelector('[data-tab="checks"]').classList.add('active');
-    document.getElementById('tab-extracted').classList.add('hidden');
-    document.getElementById('tab-checks').classList.remove('hidden');
-    btn.disabled = false; btn.textContent = 'Run 8 Compliance Checks →';
-  } catch (e) {
-    toast('Error: ' + e.message, 'err');
-    btn.disabled = false; btn.textContent = 'Run 8 Compliance Checks →';
-  }
-}
-
 function renderChecks() {
   const host = document.getElementById('checksView');
   host.innerHTML = '';
-  let pass = 0, fail = 0, cond = 0, pend = 0;
+  let pass=0, fail=0, cond=0, pend=0;
   for (const c of checks) {
-    if (c.result === 'PASS') pass++;
-    else if (c.result === 'FAIL') fail++;
-    else if (c.result === 'CONDITIONAL') cond++;
-    else pend++;
-
-    const badgeCls = c.result === 'PASS' ? 'badge-pass' : c.result === 'FAIL' ? 'badge-fail' : c.result === 'CONDITIONAL' ? 'badge-cond' : 'badge-pend';
+    if (c.result==='PASS') pass++; else if (c.result==='FAIL') fail++;
+    else if (c.result==='CONDITIONAL') cond++; else pend++;
+    const badgeCls = c.result==='PASS'?'badge-pass':c.result==='FAIL'?'badge-fail':c.result==='CONDITIONAL'?'badge-cond':'badge-pend';
     const card = document.createElement('div');
     card.className = 'check-card';
-    let dataHtml = '';
+    // OM box with open button (skip entire box for structural / non-OM checks)
+    const isStructural = !c.om_pdf && /^structural/i.test(c.om_ref || '');
+    const omBtn = c.om_pdf
+      ? `<button class="om-open-btn" onclick="openOM('${c.om_pdf}', '${esc(c.om_ref)}', '${esc(c.om_page||'')}')">📄 Open OM PDF</button>`
+      : '';
+    const pageChip = c.om_page ? `<span class="om-page-chip">${esc(c.om_page)}</span>` : '';
+    const omBoxHtml = isStructural
+      ? `<div class="om-box" style="border-left-color:var(--grey-500);">
+           <div class="om-box-top"><span class="om-ref-label" style="color:var(--grey-700);">ℹ️ ${esc(c.om_ref)}</span></div>
+           <div class="om-excerpt-text">${esc(c.om_excerpt)}</div>
+         </div>`
+      : `<div class="om-box">
+           <div class="om-box-top">
+             <span class="om-ref-label">📚 ${esc(c.om_ref)}</span>
+             ${pageChip}
+           </div>
+           <div class="om-excerpt-text">${esc(c.om_excerpt)}</div>
+           ${omBtn || '<span class="text-muted text-small">Reference document not bundled in app</span>'}
+         </div>`;
+    const sources = (c.source_refs||[]).map(s=>`<span class="source-chip">📎 ${SLOT_LABELS[s.slot]||s.slot}${s.label?` — ${esc(s.label)}`:''}</span>`).join('');
 
-    // Special rendering for CHK-3 (rate compliance) — show line item table
-    if (c.id === 'CHK-3' && c.data?.lines?.length) {
-      dataHtml += `<div class="card-title mt-12">Line-by-line rate analysis</div>
-        <table class="bill-table">
-          <thead><tr><th>Description</th><th>CGHS Code</th><th>CGHS Rate (₹)</th><th>Claimed (₹)</th><th>Admissible (₹)</th><th>Status</th></tr></thead>
-          <tbody>${c.data.lines.map(l => `
-            <tr>
-              <td>${escapeHtml(l.description || '—')}</td>
-              <td>${escapeHtml(l.cghs_code || '—')}</td>
-              <td class="text-right">${l.cghs_rate != null ? Math.round(l.cghs_rate).toLocaleString('en-IN') : '<span class="text-muted">unknown</span>'}</td>
-              <td class="text-right">${Number(l.claimed).toLocaleString('en-IN')}</td>
-              <td class="text-right">${Number(l.admissible).toLocaleString('en-IN')}</td>
-              <td><span class="line-status-${l.status === 'restricted' ? 'restricted' : l.status === 'within_rate' ? 'within' : 'unknown'}">${l.status === 'restricted' ? 'Restricted' : l.status === 'within_rate' ? 'Within rate' : 'Code not found'}</span></td>
-            </tr>`).join('')}
-          </tbody>
-          <tfoot><tr style="background:#e6f0ff;font-weight:700;">
-            <td colspan="3">Total</td>
-            <td class="text-right">${(c.data.total_claimed || 0).toLocaleString('en-IN')}</td>
-            <td class="text-right">${(c.data.total_admissible || 0).toLocaleString('en-IN')}</td>
-            <td></td>
-          </tr></tfoot>
-        </table>`;
-    }
-    if (c.id === 'CHK-5' && c.data?.matched) {
-      dataHtml += `<div class="om-box" style="border-left-color: var(--green);">
-        <div class="om-ref">Match</div>
-        <div>${escapeHtml(c.data.matched.name)} · ${escapeHtml(c.data.matched.accreditation || 'no accreditation')} · ${escapeHtml(c.data.matched.tier)} · ${escapeHtml(c.data.matched.address)}</div>
+    // CHK-3 rate table with dual-source citation (2024 vs 2025)
+    let extra = '';
+    if (c.id==='CHK-3' && c.data?.lines?.length) {
+      const applicableBadge = c.data.applicable_list==='2024'
+        ? '<span class="badge badge-cond">2024 List Applicable</span>'
+        : c.data.applicable_list==='2025'
+          ? '<span class="badge badge-pass">2025 List Applicable</span>'
+          : '<span class="badge badge-pend">Date unknown</span>';
+      extra += `<div class="card-title mt-12" style="margin-bottom:6px;display:flex;align-items:center;gap:8px;flex-wrap:wrap;">
+        <span>Line-by-line rate analysis — ${esc(c.data.accreditation||'NABH')}, ${esc((c.data.tier||'').replace('_',' '))}</span>
+        ${applicableBadge}
+      </div>
+      <div class="text-small text-muted" style="margin-bottom:8px;">${esc(c.data.applicable_label||'')}</div>
+      <div style="overflow-x:auto;"><table class="bill-table">
+        <thead><tr>
+          <th rowspan="2" style="vertical-align:middle;">Description</th>
+          <th rowspan="2" style="vertical-align:middle;">CGHS Code</th>
+          <th rowspan="2" style="vertical-align:middle;" class="text-right">Claimed (₹)</th>
+          <th colspan="3" style="text-align:center;border-right:2px solid #fff;">CGHS Rates 2024 (Pre-revision)</th>
+          <th colspan="3" style="text-align:center;">CGHS Rates 2025 (OM 03-10-2025)</th>
+        </tr><tr>
+          <th class="text-right" style="background:#1a4fa3;">Rate (₹)</th>
+          <th class="text-right" style="background:#1a4fa3;">Admissible (₹)</th>
+          <th style="background:#1a4fa3;border-right:2px solid #fff;">Status</th>
+          <th class="text-right" style="background:#1a4fa3;">Rate (₹)</th>
+          <th class="text-right" style="background:#1a4fa3;">Admissible (₹)</th>
+          <th style="background:#1a4fa3;">Status</th>
+        </tr></thead><tbody>`;
+      for (const l of c.data.lines) {
+        const stCls2024 = l.status_2024==='restricted'?'status-restricted':l.status_2024==='within_rate'?'status-within':'status-unlisted';
+        const stCls2025 = l.status_2025==='restricted'?'status-restricted':l.status_2025==='within_rate'?'status-within':l.status_2025==='unlisted'?'status-unlisted':'status-nocode';
+        const stLbl = (st) => st==='restricted'?'Restricted':st==='within_rate'?'Within':st==='unlisted'?'Not found':st==='no_code'?'No code':st==='no_rate_for_tier'?'No tier rate':st;
+        const rate2024 = l.rate_2024!=null ? `₹${Math.round(l.rate_2024).toLocaleString('en-IN')}<div class="text-small text-muted">Sr.${esc(l.matched_old_sr||'—')}, p.${esc(l.matched_old_page||'—')}</div>` : '<span class="text-muted">—</span>';
+        const rate2025 = l.rate_2025!=null ? `₹${Math.round(l.rate_2025).toLocaleString('en-IN')}` : '<span class="text-muted">—</span>';
+        const isApplicable2025 = c.data.applicable_list === '2025';
+        const isApplicable2024 = c.data.applicable_list === '2024';
+        extra += `<tr>
+          <td>${esc(l.description||'—')}</td>
+          <td class="text-mono">${esc(l.cghs_code||'—')}</td>
+          <td class="text-right">₹${Number(l.claimed).toLocaleString('en-IN')}</td>
+          <td class="text-right" ${isApplicable2024?'style="background:#fff7e6;"':''}>${rate2024}</td>
+          <td class="text-right" ${isApplicable2024?'style="background:#fff7e6;font-weight:700;"':''}>₹${Number(l.admissible_2024).toLocaleString('en-IN')}</td>
+          <td ${isApplicable2024?'style="background:#fff7e6;border-right:2px solid #ddd;"':'style="border-right:2px solid #ddd;"'}><span class="${stCls2024}">${stLbl(l.status_2024)}</span></td>
+          <td class="text-right" ${isApplicable2025?'style="background:#e6f4ea;"':''}>${rate2025}</td>
+          <td class="text-right" ${isApplicable2025?'style="background:#e6f4ea;font-weight:700;"':''}>₹${Number(l.admissible_2025).toLocaleString('en-IN')}</td>
+          <td ${isApplicable2025?'style="background:#e6f4ea;"':''}><span class="${stCls2025}">${stLbl(l.status_2025)}</span></td>
+        </tr>`;
+      }
+      extra += `</tbody><tfoot><tr style="font-weight:700;background:#e6f0ff;">
+        <td colspan="2">Grand Total</td>
+        <td class="text-right">₹${Number(c.data.total_claimed).toLocaleString('en-IN')}</td>
+        <td colspan="2" class="text-right" ${c.data.applicable_list==='2024'?'style="background:#fff7e6;"':''}>₹${Number(c.data.total_admissible_old).toLocaleString('en-IN')}</td>
+        <td style="border-right:2px solid #ddd;"></td>
+        <td colspan="2" class="text-right" ${c.data.applicable_list==='2025'?'style="background:#e6f4ea;"':''}>₹${Number(c.data.total_admissible_new).toLocaleString('en-IN')}</td>
+        <td></td>
+      </tr></tfoot></table></div>
+      <div class="text-small text-muted" style="margin-top:6px;">
+        <b>Note:</b> The highlighted column reflects rates from the OM applicable to the treatment date. Both columns are shown for comparison so the dealing hand can verify which rate list applies.
       </div>`;
     }
-
-    const sources = (c.source_refs || []).map(s => `<span class="source-chip">📎 ${SLOT_LABELS[s.slot] || s.slot}${s.label ? ' — ' + escapeHtml(s.label) : ''}</span>`).join('');
-
-    const overrideHtml = (c.result === 'FAIL' || c.result === 'CONDITIONAL')
-      ? `<div class="check-override">
-          <label>⚠ Override / Justification (required for FAIL):</label>
-          <textarea data-check="${c.id}" placeholder="Explain why this finding is being overridden — e.g., 'Emergency, ex-post-facto approval enclosed at FR-III' or 'Procedure code XYZ corresponds to rate-card item ABC, restricted accordingly'.">${escapeHtml(overrides[c.id] || '')}</textarea>
-        </div>`
-      : '';
-
+    if (c.id==='CHK-5' && c.data?.matched) {
+      extra += `<div class="om-box" style="border-left-color:var(--green);margin-top:8px;">
+        <div class="om-ref-label">✅ Matched from empanelment database</div>
+        <div style="font-size:12.5px;margin-top:4px;">${esc(c.data.matched.name)} &nbsp;·&nbsp; ${esc(c.data.matched.accreditation||'—')} &nbsp;·&nbsp; ${esc(c.data.matched.tier||'—')} &nbsp;·&nbsp; ${esc(c.data.matched.address||'—')} &nbsp;<span class="text-muted">(${c.data.match_score}% match)</span></div>
+      </div>`;
+    }
+    const needsOverride = c.result==='FAIL' || c.result==='CONDITIONAL';
+    const overrideHtml = needsOverride ? `<div class="check-override">
+      <label>⚠ ${c.result==='FAIL'?'Override justification (required before generating noting)':'Dealing Hand remarks (optional)'}:</label>
+      <textarea data-check="${c.id}" placeholder="e.g. Emergency — prior permission not possible. Ex-post-facto approval enclosed at FR-III.">${esc(overrides[c.id]||'')}</textarea>
+    </div>` : '';
     card.innerHTML = `
       <div class="check-head">
-        <div>
+        <div class="check-head-left">
           <div class="check-id">${c.id}</div>
-          <div class="check-name">${escapeHtml(c.name)}</div>
+          <div class="check-name">${esc(c.name)}</div>
         </div>
         <span class="badge ${badgeCls}">${c.result}</span>
       </div>
-      <div class="check-finding">${formatMd(c.finding)}</div>
-      <div class="om-box">
-        <div class="om-ref">📚 ${escapeHtml(c.om_ref)}</div>
-        <div class="om-excerpt">${escapeHtml(c.om_excerpt)}</div>
-      </div>
+      <div class="check-finding">${fmtMd(c.finding)}</div>
+      ${omBoxHtml}
       ${sources ? `<div class="check-sources">${sources}</div>` : ''}
-      ${dataHtml}
+      ${extra}
       ${overrideHtml}
     `;
     host.appendChild(card);
@@ -380,79 +347,53 @@ function renderChecks() {
      <span class="badge badge-pend">${pend} PENDING</span>`;
 }
 
-function formatMd(s) {
-  return escapeHtml(s).replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>');
+async function runChecks() {
+  collectEdits();
+  const btn = document.getElementById('runChecksBtn');
+  btn.disabled=true; btn.innerHTML='<span class="spinner"></span> Running…';
+  try {
+    const r = await fetch('/api/checks', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({extracted}) });
+    if (!r.ok) { const e=await r.json().catch(()=>({})); toast(e.error||'Failed.','err'); btn.disabled=false; btn.textContent='Run 8 Compliance Checks →'; return; }
+    const data = await r.json();
+    checks = data.checks;
+    renderChecks();
+    document.querySelectorAll('.check-tab').forEach(x=>x.classList.remove('active'));
+    document.querySelector('[data-tab="checks"]').classList.add('active');
+    document.getElementById('tab-extracted').classList.add('hidden');
+    document.getElementById('tab-checks').classList.remove('hidden');
+  } catch(e) { toast('Error: '+e.message,'err'); }
+  btn.disabled=false; btn.textContent='Run 8 Compliance Checks →';
 }
 
 document.getElementById('runChecksBtn').addEventListener('click', runChecks);
 document.getElementById('rerunBtn').addEventListener('click', runChecks);
 
 document.getElementById('generateNotingBtn').addEventListener('click', async () => {
-  // Collect overrides
-  document.querySelectorAll('textarea[data-check]').forEach(t => {
-    overrides[t.dataset.check] = t.value.trim();
-  });
-  // Validate that every FAIL has an override
-  const missingFails = checks.filter(c => c.result === 'FAIL' && !overrides[c.id]);
-  if (missingFails.length > 0) {
-    toast(`Provide justification for failed check(s): ${missingFails.map(c => c.id).join(', ')}`, 'err');
-    return;
-  }
-  // Save overrides into session via the noting endpoint
+  document.querySelectorAll('textarea[data-check]').forEach(t => { overrides[t.dataset.check] = t.value.trim(); });
+  const missing = checks.filter(c => c.result==='FAIL' && !overrides[c.id]);
+  if (missing.length) { toast(`Add justification for FAIL check(s): ${missing.map(c=>c.id).join(', ')}`, 'err'); return; }
   const btn = document.getElementById('generateNotingBtn');
-  btn.disabled = true; btn.innerHTML = '<span class="spinner"></span> Generating noting…';
+  btn.disabled=true; btn.innerHTML='<span class="spinner"></span> Generating…';
   try {
-    const r = await fetch('/api/noting', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ overrides })
-    });
-    if (!r.ok) {
-      const err = await r.json().catch(() => ({}));
-      toast(err.error || 'Generation failed.', 'err');
-      btn.disabled = false; btn.textContent = 'Generate Noting →';
-      return;
-    }
+    const r = await fetch('/api/noting', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({overrides}) });
+    if (!r.ok) { const e=await r.json().catch(()=>({})); toast(e.error||'Failed.','err'); btn.disabled=false; btn.textContent='Generate Noting →'; return; }
     window.location.href = '/noting';
-  } catch (e) {
-    toast('Error: ' + e.message, 'err');
-    btn.disabled = false; btn.textContent = 'Generate Noting →';
-  }
+  } catch(e) { toast('Error: '+e.message,'err'); btn.disabled=false; btn.textContent='Generate Noting →'; }
 });
 
-function toast(msg, kind) {
-  const host = document.getElementById('toasts');
-  const t = document.createElement('div');
-  t.className = 'toast' + (kind === 'err' ? ' toast-err' : kind === 'ok' ? ' toast-ok' : '');
-  t.textContent = msg;
-  host.appendChild(t);
-  setTimeout(() => t.remove(), 4000);
-}
-
-// Initial load — pull the extracted data from the server (it's in the session-tied claim)
 async function init() {
   await loadUser();
-  // Re-run extraction snapshot via the checks endpoint (which returns consolidated)
-  // Actually we need a pure read endpoint. We'll just call /api/checks once to get extracted+checks back.
   try {
-    const r = await fetch('/api/checks', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({}) });
-    if (!r.ok) {
-      // No active claim — nothing extracted, send back to upload
-      window.location.href = '/upload';
-      return;
-    }
+    const r = await fetch('/api/claim');
+    if (!r.ok) { window.location.href='/upload'; return; }
     const data = await r.json();
-    checks = data.checks;
-    // We also need extracted; fetch via /api/me indirectly... Let's add a lightweight endpoint by using consolidated as a fallback
-    // For now, request extracted from a new endpoint
-    const r2 = await fetch('/api/claim');
-    const data2 = await r2.json();
-    extracted = data2.extracted || {};
+    extracted = data.extracted || {};
+    if (data.checks) { checks = data.checks; }
     buildExtractedView();
-    renderChecks();
-  } catch (e) {
-    toast('Failed to load claim: ' + e.message, 'err');
-  }
+    if (checks.length) renderChecks();
+    // Auto-run checks if we have extracted data
+    if (Object.values(extracted).some(s=>s.length>0)) runChecks();
+  } catch(e) { toast('Failed to load: '+e.message,'err'); }
 }
 init();
 </script>

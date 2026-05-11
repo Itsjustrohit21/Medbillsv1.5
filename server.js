@@ -11,7 +11,71 @@ const PORT = process.env.PORT || 3000;
 
 // ---------- Reference data ----------
 const RATES = JSON.parse(fs.readFileSync(path.join(__dirname, 'data', 'cghs_rates.json'), 'utf8'));
+const RATES_OLD = JSON.parse(fs.readFileSync(path.join(__dirname, 'data', 'cghs_rates_old_2024.json'), 'utf8'));
 const HOSPITALS = JSON.parse(fs.readFileSync(path.join(__dirname, 'data', 'empanelled_hospitals.json'), 'utf8'));
+
+// Build a normalized-description → old-rate index for fuzzy matching
+function normDesc(s) {
+  return String(s || '').toLowerCase()
+    .replace(/[^a-z0-9 ]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+const OLD_RATES_BY_DESC = {};   // exact normalized description → entry
+const OLD_RATES_BY_TOKENS = []; // [{tokens:Set, entry}] for fuzzy match
+for (const k in RATES_OLD) {
+  const e = RATES_OLD[k];
+  const nd = normDesc(e.description);
+  OLD_RATES_BY_DESC[nd] = e;
+  const tokens = new Set(nd.split(' ').filter(t => t.length > 3));
+  if (tokens.size > 0) OLD_RATES_BY_TOKENS.push({ tokens, entry: e, nd });
+}
+
+function lookupOldRateByDescription(desc) {
+  if (!desc) return null;
+  const nd = normDesc(desc);
+  if (!nd) return null;
+  if (OLD_RATES_BY_DESC[nd]) return { entry: OLD_RATES_BY_DESC[nd], score: 100, match_type: 'exact' };
+
+  // Stemming-lite: drop trailing 's' for plurals
+  const stem = s => s.replace(/s\b/g, '');
+  const ndStem = stem(nd);
+  const queryTokens = new Set(ndStem.split(' ').filter(t => t.length > 2));
+  if (queryTokens.size === 0) return null;
+
+  let best = null, bestScore = 0;
+  for (const cand of OLD_RATES_BY_TOKENS) {
+    const candStem = stem(cand.nd);
+    const candTokens = new Set(candStem.split(' ').filter(t => t.length > 2));
+    if (candTokens.size === 0) continue;
+    const intersect = [...queryTokens].filter(t => candTokens.has(t)).length;
+    if (intersect === 0) continue;
+    const union = queryTokens.size + candTokens.size - intersect;
+    let score = (intersect / union) * 100;
+    // Strong bonus for substring containment (handles "Joints Aspiration" → "Joints Aspiration")
+    if (candStem === ndStem) score = 100;
+    else if (candStem.includes(ndStem) || ndStem.includes(candStem)) score = Math.max(score, 90);
+    // Penalty when very few tokens match
+    if (intersect < 2 && queryTokens.size > 2) score *= 0.5;
+    if (score > bestScore) { bestScore = score; best = cand.entry; }
+  }
+  // Stricter threshold for fuzzy — require 70% to avoid spurious matches
+  return bestScore >= 70 ? { entry: best, score: Math.round(bestScore), match_type: bestScore === 100 ? 'exact_stem' : 'fuzzy' } : null;
+}
+
+function lookupOldRateBySrNo(srNo) {
+  if (!srNo) return null;
+  const k = String(srNo).trim();
+  return RATES_OLD[k] || null;
+}
+
+function getOldApplicableRate(oldEntry, accreditation) {
+  if (!oldEntry) return null;
+  const a = String(accreditation || '').toUpperCase();
+  // Old list has only Non-NABH and NABH columns
+  if (a.includes('NABH') || a.includes('SUPER')) return oldEntry.nabh || oldEntry.non_nabh;
+  return oldEntry.non_nabh || oldEntry.nabh;
+}
 
 // Hospital lookup helpers
 function normalizeHospName(s) {
@@ -94,11 +158,17 @@ function wardRank(w) {
 app.set('trust proxy', 1);
 app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ extended: true, limit: '50mb' }));
+const isProd = process.env.NODE_ENV === 'production';
 app.use(session({
   secret: process.env.SESSION_SECRET || 'cghs-dev-secret-change-me',
   resave: false,
   saveUninitialized: false,
-  cookie: { maxAge: 8 * 60 * 60 * 1000, secure: false, httpOnly: true, sameSite: 'lax' }
+  cookie: {
+    maxAge: 8 * 60 * 60 * 1000,
+    secure: isProd,
+    httpOnly: true,
+    sameSite: isProd ? 'none' : 'lax'
+  }
 }));
 
 // Static
@@ -430,44 +500,54 @@ function consolidateExtraction(extracted) {
 }
 
 function check1_TypeOfClaim(c) {
-  const e = c.eclaim;
-  let claim_type = 'OPD';
-  let is_emergency = false;
-  let prior_permission = false;
-  let total = 0;
-  if (e) {
-    is_emergency = String(e.is_emergency || '').toLowerCase().startsWith('y');
-    prior_permission = String(e.prior_permission_taken || '').toLowerCase().startsWith('y');
-    total = Number(e.total_amount_claimed || 0);
-    const tt = String(e.treatment_type || '').toLowerCase();
-    if (tt.includes('indoor')) claim_type = 'IPD';
-    else if (tt.includes('mixed')) claim_type = 'Mixed';
-    else if (tt.includes('investig')) claim_type = 'Investigations';
-    else claim_type = 'OPD';
-  }
-  // Check bills for IPD signals if e-claim is silent
-  const ipdSignals = c.bills.some(b => b && (b.is_ipd === true || b.admission_date || b.ward_category));
-  if (ipdSignals && claim_type === 'OPD') claim_type = 'IPD';
-  if (is_emergency) claim_type = (claim_type === 'IPD' ? 'Emergency-IPD' : 'Emergency-OPD');
-  if (is_emergency && !prior_permission) claim_type += ' (without prior permission)';
-  else if (is_emergency && prior_permission) claim_type += ' (with prior permission)';
+  const e = c.eclaim || {};
+  const bills = c.bills || [];
 
-  // Delegation: amount > 5L (older limit) but the OM dated 16-02-2026 raises to 10L.
-  // We flag whether IFD consultation is required.
-  const requiresIFD = total > 1000000;
-  const note = total > 500000
-    ? (requiresIFD ? `Amount > ₹10L — IFD concurrence required.` : `Amount > ₹5L but ≤ ₹10L — covered under enhanced delegation per OM dated 16-02-2026; HoD may settle without IFD.`)
-    : `Amount within normal HoD delegation.`;
+  // Structural classification — based on what the bills actually show
+  // IPD if any bill has admission/discharge dates, ward category, or is marked is_ipd
+  const ipdSignals = [];
+  for (const b of bills) {
+    if (!b) continue;
+    if (b.is_ipd === true) ipdSignals.push('hospital marked is_ipd=true');
+    if (b.admission_date) ipdSignals.push(`admission date present (${b.admission_date})`);
+    if (b.discharge_date) ipdSignals.push(`discharge date present (${b.discharge_date})`);
+    if (b.ward_category && !/^null|^none/i.test(b.ward_category)) ipdSignals.push(`ward category: ${b.ward_category}`);
+  }
+  // Emergency declared on e-claim
+  const is_emergency = String(e.is_emergency || '').toLowerCase().startsWith('y');
+  const prior_permission = String(e.prior_permission_taken || '').toLowerCase().startsWith('y');
+
+  let claim_type;
+  let basis;
+  if (ipdSignals.length > 0) {
+    claim_type = is_emergency ? 'Emergency-IPD' : 'IPD';
+    basis = `IPD indicators found in hospital bills: ${ipdSignals.slice(0,3).join('; ')}.`;
+  } else if (is_emergency) {
+    claim_type = 'Emergency-OPD';
+    basis = 'No admission/discharge details found; e-Claim flags emergency.';
+  } else {
+    claim_type = 'OPD';
+    basis = 'No admission/discharge details, ward category, or emergency declaration found — classified as OPD claim.';
+  }
+  if (is_emergency) claim_type += prior_permission ? ' (with prior permission)' : ' (without prior permission)';
+
+  const total = Number(e.total_amount_claimed || 0)
+              || bills.reduce((s, b) => s + Number(b?.total_amount || 0), 0);
 
   return {
     id: 'CHK-1',
     name: 'Type of Claim',
     result: 'PASS',
-    finding: `Claim classified as **${claim_type}**. Total claimed: ₹${total.toLocaleString('en-IN')}. ${note}`,
-    om_ref: 'MoHFW OM No. S.11030/4/2026-EHS dated 16-02-2026 (Delegation enhancement to ₹10 lakh)',
-    om_excerpt: '"It has been decided to enhance the present ceiling limit from ₹5.00 lakh to ₹10.00 lakh for settling medical reimbursement cases by the Heads of Departments of Ministries/Departments without consultation of IFD, provided that: (i) No relaxation of CGHS/CS(MA) Rules is involved, and (ii) The entitlement is worked out strictly with reference to the prescribed CGHS/CS(MA) rate lists."',
-    source_refs: [{ slot: 'eclaim', label: 'Treatment type, emergency flag, total amount' }],
-    data: { claim_type, is_emergency, prior_permission, total, requires_IFD: requiresIFD }
+    finding: `Claim classified as **${claim_type}**. ${basis} Total claimed: ₹${total.toLocaleString('en-IN')}.`,
+    om_ref: 'Structural classification (not OM-based)',
+    om_page: null,
+    om_pdf: null,
+    om_excerpt: 'Classification of a medical reimbursement claim as IPD or OPD is determined by the nature of the bills uploaded: presence of a discharge summary, admission/discharge dates, or ward category on any hospital bill indicates IPD (hospitalisation). Absence of these indicates OPD (out-patient department). Emergency status is taken from the e-Claim form declaration.',
+    source_refs: [
+      { slot: 'hospital_bill', label: 'Admission/discharge dates, ward category' },
+      { slot: 'eclaim', label: 'Emergency declaration' }
+    ],
+    data: { claim_type, is_emergency, prior_permission, total, ipd_signals: ipdSignals }
   };
 }
 
@@ -475,94 +555,237 @@ function check2_BillReconciliation(c) {
   const eclaim_total = Number(c.eclaim?.total_amount_claimed || 0);
   const bills_sum = c.bills.reduce((s, b) => s + Number(b?.total_amount || 0), 0);
   const diff = Math.round((eclaim_total - bills_sum) * 100) / 100;
-  const tolerance = 10;
-  const passed = Math.abs(diff) <= tolerance;
+  const passed = Math.abs(diff) === 0 || (eclaim_total === 0 && bills_sum === 0);
+  const bothZero = eclaim_total === 0 && bills_sum === 0;
   return {
     id: 'CHK-2',
     name: 'Bill Amount Reconciliation',
-    result: passed ? 'PASS' : 'FAIL',
-    finding: passed
-      ? `e-Claim total (₹${eclaim_total.toLocaleString('en-IN')}) matches sum of uploaded bill amounts (₹${bills_sum.toLocaleString('en-IN')}) within ±₹${tolerance} tolerance.`
-      : `Discrepancy of ₹${Math.abs(diff).toLocaleString('en-IN')} between e-Claim total (₹${eclaim_total.toLocaleString('en-IN')}) and bills sum (₹${bills_sum.toLocaleString('en-IN')}). ${diff > 0 ? 'Bills under-reported.' : 'Bills over-reported.'}`,
-    om_ref: 'CGHS internal reconciliation; not derived from a specific OM.',
-    om_excerpt: 'Total claimed in the e-Claim form must be supported by individual cash memos / bill amounts within reasonable rounding tolerance.',
-    source_refs: [{ slot: 'eclaim', label: 'Total claimed' }, { slot: 'hospital_bill', label: 'Individual bill amounts' }],
+    result: bothZero ? 'PENDING' : passed ? 'PASS' : 'CONDITIONAL',
+    finding: bothZero
+      ? 'No amounts extracted. Upload the e-Claim and hospital bills to enable reconciliation.'
+      : passed
+        ? `e-Claim total (₹${eclaim_total.toLocaleString('en-IN')}) exactly matches sum of uploaded bill amounts (₹${bills_sum.toLocaleString('en-IN')}).`
+        : `Discrepancy of ₹${Math.abs(diff).toLocaleString('en-IN')} between e-Claim total (₹${eclaim_total.toLocaleString('en-IN')}) and sum of uploaded bills (₹${bills_sum.toLocaleString('en-IN')}). ${diff > 0 ? 'Bills under-reported — verify missing bills.' : 'Bills over-reported — verify if duplicate bills uploaded.'}`,
+    om_ref: 'CGHS Internal Processing — Claim Reconciliation',
+    om_excerpt: 'Total amount claimed in the GIFMIS/PFMS e-Claim form must exactly match the aggregate of individual cash memos and bills attached. Any variance must be explained with a noting.',
+    om_page: null,
+    source_refs: [{ slot: 'eclaim', label: 'Total claimed field' }, { slot: 'hospital_bill', label: 'Individual bill totals' }],
     data: { eclaim_total, bills_sum, difference: diff }
   };
 }
 
 function check3_RateCompliance(c) {
-  // For each bill line, look up CGHS rate; flag overshoot
-  const tier = 'Tier_I'; // default; in production we'd derive from hospital city
-  const lines = [];
-  let total_claimed = 0;
-  let total_admissible = 0;
-  let any_overshoot = false;
+  // Determine hospital tier & accreditation from matched hospital
+  const hospName = c.eclaim?.hospital_name || c.bills.find(b => b?.hospital_name)?.hospital_name;
+  const hospCity = c.bills.find(b => b?.city)?.city || '';
+  const hospMatch = lookupHospital(hospName, hospCity);
+  const tier = hospMatch?.hospital?.tier?.includes('2') ? 'Tier_II'
+             : hospMatch?.hospital?.tier?.includes('3') ? 'Tier_III' : 'Tier_I';
+  const accreditation = hospMatch?.hospital?.accreditation || 'NABH';
 
-  // Use bill line items if present, else fall back to e-claim bill_lines
+  // Gather line items
   const sources = [];
   for (const b of c.bills) {
     if (b && Array.isArray(b.line_items)) {
       for (const li of b.line_items) {
-        sources.push({
-          description: li.description,
-          cghs_code: li.cghs_code,
-          amount: Number(li.amount || 0),
-          source: 'bill'
-        });
+        sources.push({ description: li.description, cghs_code: li.cghs_code, amount: Number(li.amount || 0) });
       }
     }
   }
   if (sources.length === 0 && c.eclaim?.bill_lines) {
     for (const li of c.eclaim.bill_lines) {
-      sources.push({
-        description: li.treatment_type || 'Item',
-        cghs_code: li.cghs_sr_no,
-        amount: Number(li.amount || 0),
-        source: 'eclaim'
-      });
+      sources.push({ description: li.treatment_type || 'Item', cghs_code: li.cghs_sr_no, amount: Number(li.amount || 0) });
     }
   }
 
+  const lines = [];
+  let total_claimed = 0, total_admissible_new = 0, total_admissible_old = 0;
+  let any_overshoot_new = false, any_overshoot_old = false, unlisted_count = 0;
+
+  // Treatment date determines which OM is applicable
+  // OM dated 03-10-2025 — applies on/after 03-Oct-2025
+  // Old rates 2024 — applied before 03-Oct-2025
+  function parseDateDDMMYYYY(s) {
+    if (!s) return null;
+    const m = String(s).match(/(\d{1,2})[-\/](\d{1,2})[-\/](\d{4})/);
+    if (!m) return null;
+    return new Date(parseInt(m[3]), parseInt(m[2]) - 1, parseInt(m[1]));
+  }
+  const treatmentDateStr = c.bills.find(b => b?.bill_date || b?.admission_date)?.bill_date
+                        || c.bills.find(b => b?.admission_date)?.admission_date
+                        || c.eclaim?.bill_lines?.[0]?.from_date;
+  const treatmentDate = parseDateDDMMYYYY(treatmentDateStr);
+  const cutoff = new Date(2025, 9, 3); // 03-Oct-2025
+  let applicable_list, applicable_label;
+  if (!treatmentDate) {
+    applicable_list = 'unknown';
+    applicable_label = 'Treatment date not extracted — defaulting to 2025 list. Verify manually.';
+  } else if (treatmentDate >= cutoff) {
+    applicable_list = '2025';
+    applicable_label = `Treatment date ${treatmentDate.toLocaleDateString('en-IN')} is on/after 03-Oct-2025 — CGHS Rates 2025 (OM dated 03-10-2025) apply.`;
+  } else {
+    applicable_list = '2024';
+    applicable_label = `Treatment date ${treatmentDate.toLocaleDateString('en-IN')} is before 03-Oct-2025 — CGHS Rates 2024 (pre-revision) apply.`;
+  }
+
   for (const li of sources) {
-    const rateEntry = lookupCghsCode(li.cghs_code);
-    const cghsRate = rateEntry ? getApplicableRate(rateEntry, tier, 'NABH') : null;
     const claimed = li.amount;
-    let admissible, status;
-    if (cghsRate == null) {
-      admissible = claimed; // unknown — pass through, flagged in CHK-6/7
-      status = 'unknown_code';
-    } else if (claimed > cghsRate) {
-      admissible = cghsRate;
-      status = 'restricted';
-      any_overshoot = true;
-    } else {
-      admissible = claimed;
-      status = 'within_rate';
-    }
     total_claimed += claimed;
-    total_admissible += admissible;
+
+    // === Lookup in NEW (2025) rate list — by CGHS code ===
+    // === Lookup in NEW (2025) rate list — by CGHS code ===
+    let newEntry = lookupCghsCode(li.cghs_code);
+    let newRate = newEntry ? getApplicableRate(newEntry, tier, accreditation) : null;
+    let newDesc = newEntry?.description || null;
+    let new_match_via = newEntry ? 'code' : null;
+
+    // === Lookup in OLD (2024) rate list — Sr No (if numeric) OR by description ===
+    let oldMatch = null;
+    if (li.cghs_code && /^\d+$/.test(String(li.cghs_code).trim())) {
+      const direct = lookupOldRateBySrNo(li.cghs_code);
+      if (direct) oldMatch = { entry: direct, score: 100, match_type: 'sr_no' };
+    }
+    if (!oldMatch) {
+      // Try by description — use line description first, then new list's description if available
+      oldMatch = lookupOldRateByDescription(li.description)
+              || (newDesc ? lookupOldRateByDescription(newDesc) : null);
+    }
+    const oldRate = oldMatch ? getOldApplicableRate(oldMatch.entry, accreditation) : null;
+    const oldDesc = oldMatch?.entry?.description || null;
+
+    // === Cross-lookup: if we got 2024 match but no 2025 match, try description-based 2025 lookup ===
+    if (!newEntry && oldDesc) {
+      // Search 2025 rate list by description match (same fuzzy logic)
+      const lcDesc = normDesc(oldDesc);
+      for (const k in RATES) {
+        if (normDesc(RATES[k].description) === lcDesc) {
+          newEntry = RATES[k];
+          newRate = getApplicableRate(newEntry, tier, accreditation);
+          newDesc = newEntry.description;
+          new_match_via = 'description';
+          break;
+        }
+      }
+    }
+    if (!newEntry && li.description) {
+      // Last attempt: fuzzy match line description against 2025 list descriptions
+      const lcDesc = normDesc(li.description);
+      for (const k in RATES) {
+        if (normDesc(RATES[k].description) === lcDesc) {
+          newEntry = RATES[k];
+          newRate = getApplicableRate(newEntry, tier, accreditation);
+          newDesc = newEntry.description;
+          new_match_via = 'description';
+          break;
+        }
+      }
+    }
+
+    // === Determine admissible by both lists ===
+    let admissible_new, admissible_old;
+    let status_new, status_old;
+
+    if (newRate == null) {
+      admissible_new = claimed;
+      status_new = newEntry ? 'no_rate_for_tier' : (li.cghs_code ? 'unlisted' : 'no_code');
+      if (!newEntry && li.cghs_code) unlisted_count++;
+    } else if (claimed > newRate) {
+      admissible_new = newRate;
+      status_new = 'restricted';
+      any_overshoot_new = true;
+    } else {
+      admissible_new = claimed;
+      status_new = 'within_rate';
+    }
+
+    if (oldRate == null) {
+      admissible_old = claimed;
+      status_old = 'unlisted';
+    } else if (claimed > oldRate) {
+      admissible_old = oldRate;
+      status_old = 'restricted';
+      any_overshoot_old = true;
+    } else {
+      admissible_old = claimed;
+      status_old = 'within_rate';
+    }
+
+    total_admissible_new += admissible_new;
+    total_admissible_old += admissible_old;
+
+    // Which list is actually applicable for this claim?
+    const final_admissible = applicable_list === '2024' ? admissible_old : admissible_new;
+    const final_status = applicable_list === '2024' ? status_old : status_new;
+    const final_source = applicable_list === '2024'
+      ? (oldMatch ? `OM 2024 (Sr.No. ${oldMatch.entry.sr_no}, Page ${oldMatch.entry.page || '—'})` : 'OM 2024 — not found')
+      : (newEntry ? `OM 03-10-2025 (Code ${Object.keys(RATES).find(k=>RATES[k]===newEntry) || li.cghs_code}, via ${new_match_via})` : 'OM 03-10-2025 — not in list');
+
     lines.push({
       description: li.description,
       cghs_code: li.cghs_code,
-      cghs_rate: cghsRate,
+      matched_new_desc: newDesc,
+      matched_old_desc: oldMatch?.entry?.description || null,
+      matched_old_sr: oldMatch?.entry?.sr_no || null,
+      matched_old_page: oldMatch?.entry?.page || null,
+      old_match_score: oldMatch?.score || 0,
+      old_match_type: oldMatch?.match_type || null,
       claimed,
-      admissible,
-      status
+      // 2025 rates
+      rate_2025: newRate,
+      admissible_2025: admissible_new,
+      status_2025: status_new,
+      // 2024 rates
+      rate_2024: oldRate,
+      admissible_2024: admissible_old,
+      status_2024: status_old,
+      // Final per applicable date
+      admissible_final: final_admissible,
+      status_final: final_status,
+      rate_source_cited: final_source,
+      tier,
+      accreditation
     });
   }
+
+  // Final totals based on applicable list
+  const total_admissible = applicable_list === '2024' ? total_admissible_old : total_admissible_new;
+  const any_overshoot = applicable_list === '2024' ? any_overshoot_old : any_overshoot_new;
+
+  const result = lines.length === 0 ? 'PENDING'
+               : (any_overshoot || unlisted_count > 0) ? 'CONDITIONAL'
+               : 'PASS';
 
   return {
     id: 'CHK-3',
     name: 'CGHS Rate Card Compliance',
-    result: any_overshoot ? 'CONDITIONAL' : 'PASS',
-    finding: any_overshoot
-      ? `${lines.filter(l => l.status === 'restricted').length} line(s) exceed the applicable CGHS package rate. Admissible amount restricted accordingly. Total claimed: ₹${total_claimed.toLocaleString('en-IN')}, Total admissible: ₹${total_admissible.toLocaleString('en-IN')}.`
-      : `All ${lines.length} claimed line items are within applicable CGHS package rates. Admissible: ₹${total_admissible.toLocaleString('en-IN')}.`,
-    om_ref: 'MoHFW OM No. 5-16/CGHS(HQ)/HEC/2024(Part I) dated 03-10-2025',
-    om_excerpt: 'CGHS rates revised vide OM dated 3rd October 2025 are applicable for treatment at empanelled HCOs. Reimbursement to beneficiaries shall be restricted to the prescribed CGHS package rates as per tier (I/II/III) and accreditation status (NABH / Non-NABH / Super-Specialty).',
-    source_refs: [{ slot: 'hospital_bill', label: 'Itemised bill' }, { slot: 'eclaim', label: 'Bill lines' }],
-    data: { lines, total_claimed, total_admissible }
+    result,
+    finding: lines.length === 0
+      ? 'No itemised bill data extracted. Upload hospital bills with line items to enable rate-card check.'
+      : `${applicable_label} ${any_overshoot ? `${lines.filter(l => l.status_final === 'restricted').length} line(s) exceed applicable rate — admissible restricted.` : 'All lines within applicable rates.'} Claimed: ₹${total_claimed.toLocaleString('en-IN')}, Admissible (per applicable list): ₹${total_admissible.toLocaleString('en-IN')}.`,
+    om_ref: applicable_list === '2024'
+      ? 'CGHS Rate Card 2024 (pre-revision rate list) — applicable for treatment before 03-10-2025'
+      : 'MoHFW OM No. 5-16/CGHS(HQ)/HEC/2024(Part I) dated 03-10-2025',
+    om_page: applicable_list === '2024'
+      ? 'Page reference per line item (see Source column in table)'
+      : 'Annexure-I (Rate List) — applicable tier and accreditation column',
+    om_excerpt: applicable_list === '2024'
+      ? 'For treatments rendered before 03-10-2025, the pre-revision CGHS rate list (with Sr. No. and page-wise codification) applies. Each line item is matched against the Sr.No. and procedure name in the 2024 rate card.'
+      : 'The revised CGHS rates are applicable with effect from the date of issue of this OM (03-10-2025) for treatment at empanelled Health Care Organisations. Reimbursement is restricted to the CGHS package rates as per tier of city and accreditation status of the HCO.',
+    om_pdf: applicable_list === '2024' ? null : '/om/cghs-rates-2025.pdf',
+    source_refs: [{ slot: 'hospital_bill', label: 'Itemised bill with treatment date' }, { slot: 'eclaim', label: 'Bill lines' }],
+    data: {
+      lines,
+      total_claimed,
+      total_admissible_new,
+      total_admissible_old,
+      total_admissible,
+      tier,
+      accreditation,
+      applicable_list,
+      applicable_label,
+      treatment_date: treatmentDateStr,
+      hospital_match_score: hospMatch?.score || 0
+    }
   };
 }
 
@@ -577,6 +800,8 @@ function check4_WardEntitlement(c) {
       result: 'PASS',
       finding: 'Not applicable — this is not an IPD / hospitalisation claim. Ward entitlement check skipped.',
       om_ref: 'MoHFW OM dated 07-11-2022 (Ward entitlement based on Pay Level)',
+    om_page: 'Para 3 — Table of ward entitlement by Pay Level',
+    om_pdf: null,
       om_excerpt: 'Ward entitlement under CGHS is determined by the basic pay drawn by the principal CGHS card holder: Pay Level 1–5 — General Ward; Pay Level 6–11 — Semi-Private Ward; Pay Level 12 and above — Private Ward.',
       source_refs: [],
       data: { applicable: false }
@@ -608,6 +833,8 @@ function check4_WardEntitlement(c) {
     result,
     finding,
     om_ref: 'MoHFW OM dated 07-11-2022 (Pay-Level-based ward entitlement)',
+    om_page: 'Para 2 — Ward entitlement table by Pay Level',
+    om_pdf: null,
     om_excerpt: 'Ward entitlement under CGHS: Pay Level 1–5 → General Ward; Pay Level 6–11 → Semi-Private Ward; Pay Level 12 & above → Private Ward. Where higher ward is availed, reimbursement is restricted to the entitled ward rate.',
     source_refs: [{ slot: 'cghs_card', label: 'Ward entitlement on CGHS card' }, { slot: 'eclaim', label: 'Pay level' }, { slot: 'hospital_bill', label: 'Ward actually occupied' }],
     data: { ward_claimed: wardClaimed, entitled_ward: entitledWard, pay_level: payLevel }
@@ -643,6 +870,8 @@ function check5_HospitalEmpanelment(c) {
       result: 'PASS',
       finding: `Hospital **${hospName}** matched against CGHS empanelment list (${match.score}% match → "${match.hospital.name}", ${match.hospital.accreditation || 'no accreditation listed'}, ${match.hospital.tier}, ${match.hospital.address}).`,
       om_ref: 'CGHS Empanelled Hospitals — Delhi/HQ/Directorate/Ministry list',
+      om_page: 'Empanelment list (current) — verified against database',
+      om_pdf: null,
       om_excerpt: 'The hospital is found on the CGHS empanelled list applicable to Delhi/HQ/Directorate/Ministry beneficiaries.',
       source_refs: [{ slot: 'eclaim', label: 'Hospital name in e-Claim' }, { slot: 'hospital_bill', label: 'Hospital letterhead' }],
       data: { hospital_name: hospName, matched: match.hospital, match_score: match.score }
@@ -873,9 +1102,10 @@ app.post('/api/noting', requireAuth, (req, res) => {
   const c5 = checks[4];
   const c7 = checks[6];
 
-  // Aggregate amounts
+  // Aggregate amounts — use the list applicable to the treatment date
   const claimedTotal = c3.total_claimed || Number(e.total_amount_claimed || 0);
   const admissibleTotal = c3.total_admissible || claimedTotal;
+  const applicableList = c3.applicable_list || '2025';
 
   const isEmergency = c1.is_emergency;
   const isHospital = c1.claim_type.includes('IPD');
@@ -884,7 +1114,7 @@ app.post('/api/noting', requireAuth, (req, res) => {
   const today = new Date();
   const todayStr = today.toLocaleDateString('en-IN', { day: '2-digit', month: '2-digit', year: 'numeric' });
 
-  // Build itemised table
+  // Build itemised table — use admissible_final (which respects applicable_list)
   const tableRows = [];
   let sno = 1;
   for (const li of c3.lines || []) {
@@ -892,8 +1122,9 @@ app.post('/api/noting', requireAuth, (req, res) => {
       sno: sno++,
       description: li.description || '—',
       claimed: li.claimed || 0,
-      admissible: li.admissible || 0,
-      cghs_code: li.cghs_code || '—'
+      admissible: li.admissible_final != null ? li.admissible_final : (li.admissible || 0),
+      cghs_code: li.cghs_code || '—',
+      rate_source: li.rate_source_cited || ''
     });
   }
 
@@ -909,7 +1140,9 @@ app.post('/api/noting', requireAuth, (req, res) => {
 
   const para3 = `3. The details of the claim are as under:`;
 
-  const para4 = `4. As per **MoHFW OM No. 5-16/CGHS(HQ)/HEC/2024(Part I) dated 03-10-2025**, the prescribed CGHS rates have been applied for determining the admissible amount. ${c3.total_claimed > c3.total_admissible ? `Where claimed amounts exceeded the prescribed package rates, admissible amounts have been restricted to CGHS rates accordingly.` : 'All claimed amounts are within the prescribed CGHS rates.'}`;
+  const para4 = applicableList === '2024'
+    ? `4. The treatment dates indicate the claim relates to a period **prior to 03-10-2025**. Accordingly, the **pre-revision CGHS rate list (2024)** has been applied for determining the admissible amount, with each line item matched against the Sr. No. and procedure name in the 2024 rate card. ${c3.total_claimed > admissibleTotal ? 'Where claimed amounts exceeded the prescribed rates, admissible amounts have been restricted to CGHS rates accordingly.' : 'All claimed amounts are within the prescribed CGHS rates of the applicable list.'}`
+    : `4. The treatment dates fall **on or after 03-10-2025**. Accordingly, the revised CGHS rates notified vide **MoHFW OM No. 5-16/CGHS(HQ)/HEC/2024(Part I) dated 03-10-2025** have been applied (${c3.accreditation || 'NABH'}, ${(c3.tier || 'Tier_I').replace('_', ' ')}) for determining the admissible amount. ${c3.total_claimed > admissibleTotal ? 'Where claimed amounts exceeded the prescribed package rates, admissible amounts have been restricted to CGHS rates accordingly.' : 'All claimed amounts are within the prescribed CGHS rates.'}`;
 
   const para5_ifd = c1.total > 1000000
     ? `5. The claim amount exceeds ₹10.00 lakh. As per **MoHFW OM No. S.11030/4/2026-EHS dated 16-02-2026**, IFD concurrence is required and is being obtained.`
@@ -918,7 +1151,7 @@ app.post('/api/noting', requireAuth, (req, res) => {
       : `5. The claim amount of ₹${c1.total.toLocaleString('en-IN')}/- is within the normal delegation of HoD; no IFD consultation is required.`;
 
   const para6 = needsExPostFacto
-    ? `6. In view of the above, **ex-post-facto approval** of the competent authority is solicited for the medical claim, and ${needsExPostFacto ? '**US (Admn.)** may kindly accord financial sanction of ' : '**US (Admn.)** may kindly accord financial sanction of '}**₹${admissibleTotal.toLocaleString('en-IN')}/- (Rupees ${num2words(admissibleTotal)})** to ${e.employee_name || '______'}, ${e.designation || '______'}, towards reimbursement of medical expenses.`
+    ? `6. In view of the above, **ex-post-facto approval** of the competent authority is solicited for the medical claim, and **US (Admn.)** may kindly accord financial sanction of **₹${admissibleTotal.toLocaleString('en-IN')}/- (Rupees ${num2words(admissibleTotal)})** to ${e.employee_name || '______'}, ${e.designation || '______'}, towards reimbursement of medical expenses.`
     : `6. In view of the above, **US (Admn.)** may kindly accord financial sanction of **₹${admissibleTotal.toLocaleString('en-IN')}/- (Rupees ${num2words(admissibleTotal)})** to ${e.employee_name || '______'}, ${e.designation || '______'}, towards reimbursement of medical expenses.`;
 
   const para7 = `7. A draft sanction order is accordingly placed below for signature of US (Admn.), please.`;
