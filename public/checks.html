@@ -4,7 +4,7 @@
 <meta charset="UTF-8">
 <title>Review & Checks — CGHS Medical Bill Automation</title>
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<link rel="stylesheet" href="/styles.css?v=5">
+<link rel="stylesheet" href="/styles.css?v=6">
 </head>
 <body>
 <div class="app-shell">
@@ -88,11 +88,121 @@
   </div>
 </div>
 
+<!-- Manual code picker modal -->
+<div class="modal-overlay hidden" id="codePicker">
+  <div class="modal-box" style="max-width:780px;">
+    <div class="modal-head">
+      <div>
+        <div class="modal-head-title">🔍 Pick CGHS code manually</div>
+        <div class="modal-head-sub" id="pickerSubtitle">Search by procedure name or code</div>
+      </div>
+      <button class="modal-close" onclick="closeCodePicker()">×</button>
+    </div>
+    <div style="padding:12px 16px;border-bottom:1px solid var(--grey-200);">
+      <input type="text" id="pickerSearch" placeholder="Type at least 2 characters — e.g. 'haemogram', '1418', 'consultation'" style="width:100%;padding:9px 12px;border:1.5px solid var(--grey-300);border-radius:6px;font-size:13px;font-family:inherit;">
+      <div style="display:flex;gap:8px;margin-top:8px;align-items:center;">
+        <span class="text-small text-muted">Search in:</span>
+        <label class="text-small"><input type="radio" name="pickerList" value="both" checked> Both lists</label>
+        <label class="text-small"><input type="radio" name="pickerList" value="2024"> 2024 only</label>
+        <label class="text-small"><input type="radio" name="pickerList" value="2025"> 2025 only</label>
+      </div>
+    </div>
+    <div class="modal-body" style="padding:0;">
+      <div id="pickerResults" style="padding:8px 0;"></div>
+    </div>
+  </div>
+</div>
+
 <div class="toast-host" id="toasts"></div>
 
 <script>
 const SLOT_LABELS = { eclaim:'e-Claim Form', referral:'CGHS Referral', hospital_bill:'Hospital Bills', cghs_card:'CGHS Card', payment_proof:'Payment Proof' };
 let extracted = {}, checks = [], overrides = {};
+let pickerContext = null; // { lineIdx, applicableList, description }
+
+function openCodePicker(lineIdx, applicableList, description) {
+  pickerContext = { lineIdx, applicableList, description };
+  document.getElementById('pickerSubtitle').textContent = `For: ${description} (applicable list: ${applicableList})`;
+  document.getElementById('pickerSearch').value = description.split(' ').slice(0, 3).join(' ');
+  // Pre-select the applicable list radio
+  document.querySelector(`input[name="pickerList"][value="${applicableList}"]`)?.click();
+  document.getElementById('codePicker').classList.remove('hidden');
+  document.getElementById('pickerSearch').focus();
+  doPickerSearch();
+}
+
+function closeCodePicker() {
+  document.getElementById('codePicker').classList.add('hidden');
+  pickerContext = null;
+}
+
+let pickerTimer = null;
+function doPickerSearch() {
+  clearTimeout(pickerTimer);
+  pickerTimer = setTimeout(async () => {
+    const q = document.getElementById('pickerSearch').value.trim();
+    if (q.length < 2) {
+      document.getElementById('pickerResults').innerHTML = '<div style="padding:18px;text-align:center;color:var(--grey-500);">Type at least 2 characters to search.</div>';
+      return;
+    }
+    const list = document.querySelector('input[name="pickerList"]:checked')?.value || 'both';
+    try {
+      const r = await fetch(`/api/rates/search?q=${encodeURIComponent(q)}&list=${list}`);
+      const data = await r.json();
+      renderPickerResults(data.results || []);
+    } catch (e) {
+      document.getElementById('pickerResults').innerHTML = `<div style="padding:18px;color:var(--fail);">Search failed: ${esc(e.message)}</div>`;
+    }
+  }, 250);
+}
+
+function renderPickerResults(rows) {
+  const host = document.getElementById('pickerResults');
+  if (rows.length === 0) {
+    host.innerHTML = '<div style="padding:18px;text-align:center;color:var(--grey-500);">No matching procedures found. Try different keywords.</div>';
+    return;
+  }
+  let html = '<table style="width:100%;border-collapse:collapse;font-size:12.5px;">';
+  html += '<thead><tr style="background:var(--grey-50);border-bottom:1px solid var(--grey-200);"><th style="text-align:left;padding:7px 12px;">List</th><th style="text-align:left;padding:7px 12px;">Code / Sr.No.</th><th style="text-align:left;padding:7px 12px;">Description</th><th style="text-align:right;padding:7px 12px;">NABH Rate</th><th style="padding:7px 12px;"></th></tr></thead><tbody>';
+  for (const r of rows) {
+    const rate = r.list === '2024' ? r.nabh : (r.rates?.Tier_I?.nabh || r.rates?.Tier_I?.non_nabh || null);
+    const listBadge = r.list === '2024' ? '<span class="badge badge-cond" style="font-size:9px;">2024</span>' : '<span class="badge badge-pass" style="font-size:9px;">2025</span>';
+    html += `<tr style="border-bottom:1px solid var(--grey-100);">
+      <td style="padding:6px 12px;">${listBadge}</td>
+      <td style="padding:6px 12px;" class="text-mono">${esc(r.code)}${r.list==='2024' && r.page ? `<div class="text-small text-muted">p.${esc(r.page)}</div>` : ''}</td>
+      <td style="padding:6px 12px;">${esc(r.description)}</td>
+      <td style="padding:6px 12px;text-align:right;">${rate != null ? `₹${Math.round(rate).toLocaleString('en-IN')}` : '—'}</td>
+      <td style="padding:6px 12px;"><button class="btn-primary" style="padding:4px 10px;font-size:11px;" onclick="applyPickedCode('${r.list}', '${esc(r.code)}')">Select</button></td>
+    </tr>`;
+  }
+  html += '</tbody></table>';
+  host.innerHTML = html;
+}
+
+function applyPickedCode(list, code) {
+  if (!pickerContext) return;
+  const { lineIdx } = pickerContext;
+  // Apply to the extracted bill line so the next /api/checks call picks it up
+  // Find the hospital_bill that contains this line
+  let runningIdx = 0;
+  outer: for (const doc of (extracted.hospital_bill || [])) {
+    const items = doc.fields?.line_items || [];
+    for (let i = 0; i < items.length; i++) {
+      if (runningIdx === lineIdx) {
+        if (list === '2024') items[i].manual_code_2024 = code;
+        else items[i].manual_code_2025 = code;
+        break outer;
+      }
+      runningIdx++;
+    }
+  }
+  closeCodePicker();
+  toast('Code applied — re-running checks…', 'ok');
+  runChecks();
+}
+
+document.getElementById('pickerSearch').addEventListener('input', doPickerSearch);
+document.querySelectorAll('input[name="pickerList"]').forEach(r => r.addEventListener('change', doPickerSearch));
 
 async function loadUser() {
   const r = await fetch('/api/me');
@@ -264,7 +374,7 @@ function renderChecks() {
     }
     const sources = (c.source_refs||[]).map(s=>`<span class="source-chip">📎 ${SLOT_LABELS[s.slot]||s.slot}${s.label?` — ${esc(s.label)}`:''}</span>`).join('');
 
-    // CHK-3 rate table with dual-source citation (2024 vs 2025)
+    // CHK-3 rate table with dual-source citation (2024 vs 2025) + manual code picker
     let extra = '';
     if (c.id==='CHK-3' && c.data?.lines?.length) {
       const applicableBadge = c.data.applicable_list==='2024'
@@ -283,51 +393,81 @@ function renderChecks() {
           <th rowspan="2" style="vertical-align:middle;">CGHS Code</th>
           <th rowspan="2" style="vertical-align:middle;" class="text-right">Claimed (₹)</th>
           <th colspan="3" style="text-align:center;border-right:2px solid #fff;">CGHS Rates 2024 (Pre-revision)</th>
-          <th colspan="3" style="text-align:center;">CGHS Rates 2025 (OM 03-10-2025)</th>
+          <th colspan="3" style="text-align:center;border-right:2px solid #fff;">CGHS Rates 2025 (OM 03-10-2025)</th>
+          <th rowspan="2" style="vertical-align:middle;">Action</th>
         </tr><tr>
           <th class="text-right" style="background:#1a4fa3;">Rate (₹)</th>
           <th class="text-right" style="background:#1a4fa3;">Admissible (₹)</th>
           <th style="background:#1a4fa3;border-right:2px solid #fff;">Status</th>
           <th class="text-right" style="background:#1a4fa3;">Rate (₹)</th>
           <th class="text-right" style="background:#1a4fa3;">Admissible (₹)</th>
-          <th style="background:#1a4fa3;">Status</th>
+          <th style="background:#1a4fa3;border-right:2px solid #fff;">Status</th>
         </tr></thead><tbody>`;
-      for (const l of c.data.lines) {
-        const stCls2024 = l.status_2024==='restricted'?'status-restricted':l.status_2024==='within_rate'?'status-within':'status-unlisted';
-        const stCls2025 = l.status_2025==='restricted'?'status-restricted':l.status_2025==='within_rate'?'status-within':l.status_2025==='unlisted'?'status-unlisted':'status-nocode';
-        const stLbl = (st) => st==='restricted'?'Restricted':st==='within_rate'?'Within':st==='unlisted'?'Not found':st==='no_code'?'No code':st==='no_rate_for_tier'?'No tier rate':st;
-        const rate2024 = l.rate_2024!=null ? `₹${Math.round(l.rate_2024).toLocaleString('en-IN')}<div class="text-small text-muted">Sr.${esc(l.matched_old_sr||'—')}, p.${esc(l.matched_old_page||'—')}</div>` : '<span class="text-muted">—</span>';
-        const rate2025 = l.rate_2025!=null ? `₹${Math.round(l.rate_2025).toLocaleString('en-IN')}` : '<span class="text-muted">—</span>';
+
+      const stLbl = (st) =>
+        st === 'within_rate' ? 'Within rate' :
+        st === 'beyond_admissible' ? 'Beyond admissible' :
+        st === 'needs_manual' ? 'Needs manual selection' :
+        st || '—';
+      const stCls = (st) =>
+        st === 'within_rate' ? 'status-within' :
+        st === 'beyond_admissible' ? 'status-restricted' :
+        st === 'needs_manual' ? 'status-unlisted' : 'status-nocode';
+
+      c.data.lines.forEach((l, idx) => {
         const isApplicable2025 = c.data.applicable_list === '2025';
         const isApplicable2024 = c.data.applicable_list === '2024';
+
+        const rate2024Cell = l.rate_2024 != null
+          ? `₹${Math.round(l.rate_2024).toLocaleString('en-IN')}<div class="text-small text-muted">Sr.${esc(l.matched_old_sr||'—')}, p.${esc(l.matched_old_page||'—')}</div>`
+          : '<span class="text-muted">—</span>';
+        const rate2025Cell = l.rate_2025 != null
+          ? `₹${Math.round(l.rate_2025).toLocaleString('en-IN')}${l.matched_new_code ? `<div class="text-small text-muted">${esc(l.matched_new_code)}</div>` : ''}`
+          : '<span class="text-muted">—</span>';
+        const adm2024 = l.admissible_2024 != null ? `₹${Number(l.admissible_2024).toLocaleString('en-IN')}` : '<span class="text-muted">—</span>';
+        const adm2025 = l.admissible_2025 != null ? `₹${Number(l.admissible_2025).toLocaleString('en-IN')}` : '<span class="text-muted">—</span>';
+
+        // Action button — show picker if applicable status is needs_manual
+        const applicableStatus = isApplicable2024 ? l.status_2024 : l.status_2025;
+        const actionHtml = applicableStatus === 'needs_manual'
+          ? `<button class="btn-ghost btn-sm" onclick="openCodePicker(${idx}, '${c.data.applicable_list||'2025'}', ${JSON.stringify(l.description||'').replace(/"/g,'&quot;')})">🔍 Pick code</button>`
+          : (l.manually_resolved ? '<span class="badge badge-pass" style="font-size:9.5px;">Manual</span>' : '');
+
         extra += `<tr>
-          <td>${esc(l.description||'—')}</td>
-          <td class="text-mono">${esc(l.cghs_code||'—')}</td>
+          <td>${esc(l.description||'—')}${l.matched_old_desc && l.matched_old_desc !== l.description ? `<div class="text-small text-muted">→ ${esc(l.matched_old_desc)}</div>` : ''}</td>
+          <td class="text-mono">${esc(l.cghs_code||'—')}${l.cghs_code_stripped && l.cghs_code_stripped !== l.cghs_code ? `<div class="text-small text-muted">→ ${esc(l.cghs_code_stripped)}</div>` : ''}</td>
           <td class="text-right">₹${Number(l.claimed).toLocaleString('en-IN')}</td>
-          <td class="text-right" ${isApplicable2024?'style="background:#fff7e6;"':''}>${rate2024}</td>
-          <td class="text-right" ${isApplicable2024?'style="background:#fff7e6;font-weight:700;"':''}>₹${Number(l.admissible_2024).toLocaleString('en-IN')}</td>
-          <td ${isApplicable2024?'style="background:#fff7e6;border-right:2px solid #ddd;"':'style="border-right:2px solid #ddd;"'}><span class="${stCls2024}">${stLbl(l.status_2024)}</span></td>
-          <td class="text-right" ${isApplicable2025?'style="background:#e6f4ea;"':''}>${rate2025}</td>
-          <td class="text-right" ${isApplicable2025?'style="background:#e6f4ea;font-weight:700;"':''}>₹${Number(l.admissible_2025).toLocaleString('en-IN')}</td>
-          <td ${isApplicable2025?'style="background:#e6f4ea;"':''}><span class="${stCls2025}">${stLbl(l.status_2025)}</span></td>
+          <td class="text-right" ${isApplicable2024?'style="background:#fff7e6;"':''}>${rate2024Cell}</td>
+          <td class="text-right" ${isApplicable2024?'style="background:#fff7e6;font-weight:700;"':''}>${adm2024}</td>
+          <td ${isApplicable2024?'style="background:#fff7e6;border-right:2px solid #ddd;"':'style="border-right:2px solid #ddd;"'}><span class="${stCls(l.status_2024)}">${stLbl(l.status_2024)}</span></td>
+          <td class="text-right" ${isApplicable2025?'style="background:#e6f4ea;"':''}>${rate2025Cell}</td>
+          <td class="text-right" ${isApplicable2025?'style="background:#e6f4ea;font-weight:700;"':''}>${adm2025}</td>
+          <td ${isApplicable2025?'style="background:#e6f4ea;border-right:2px solid #ddd;"':'style="border-right:2px solid #ddd;"'}><span class="${stCls(l.status_2025)}">${stLbl(l.status_2025)}</span></td>
+          <td>${actionHtml}</td>
         </tr>`;
-      }
+      });
       extra += `</tbody><tfoot><tr style="font-weight:700;background:#e6f0ff;">
         <td colspan="2">Grand Total</td>
         <td class="text-right">₹${Number(c.data.total_claimed).toLocaleString('en-IN')}</td>
         <td colspan="2" class="text-right" ${c.data.applicable_list==='2024'?'style="background:#fff7e6;"':''}>₹${Number(c.data.total_admissible_old).toLocaleString('en-IN')}</td>
         <td style="border-right:2px solid #ddd;"></td>
         <td colspan="2" class="text-right" ${c.data.applicable_list==='2025'?'style="background:#e6f4ea;"':''}>₹${Number(c.data.total_admissible_new).toLocaleString('en-IN')}</td>
-        <td></td>
+        <td colspan="2"></td>
       </tr></tfoot></table></div>
       <div class="text-small text-muted" style="margin-top:6px;">
-        <b>Note:</b> The highlighted column reflects rates from the OM applicable to the treatment date. Both columns are shown for comparison so the dealing hand can verify which rate list applies.
+        <b>Status legend:</b>
+        <span class="status-within">Within rate</span> — claimed ≤ admissible rate;
+        <span class="status-restricted">Beyond admissible</span> — claimed exceeds rate, restricted to applicable list rate;
+        <span class="status-unlisted">Needs manual selection</span> — automatic match could not identify the procedure with confidence.
       </div>`;
     }
     if (c.id==='CHK-5' && c.data?.matched) {
+      const h = c.data.matched;
+      const sourceLine = c.data.source_list ? `<div class="text-small text-muted" style="margin-top:2px;">Source: ${esc(c.data.source_list)}${c.data.source_url ? ` &nbsp;·&nbsp; <a href="${esc(c.data.source_url)}" target="_blank" style="color:var(--navy);">View source listing ↗</a>` : ''}</div>` : '';
       extra += `<div class="om-box" style="border-left-color:var(--green);margin-top:8px;">
-        <div class="om-ref-label">✅ Matched from empanelment database</div>
-        <div style="font-size:12.5px;margin-top:4px;">${esc(c.data.matched.name)} &nbsp;·&nbsp; ${esc(c.data.matched.accreditation||'—')} &nbsp;·&nbsp; ${esc(c.data.matched.tier||'—')} &nbsp;·&nbsp; ${esc(c.data.matched.address||'—')} &nbsp;<span class="text-muted">(${c.data.match_score}% match)</span></div>
+        <div class="om-ref-label">✅ Matched empanelled facility</div>
+        <div style="font-size:12.5px;margin-top:4px;">${esc(h.name)} &nbsp;·&nbsp; ${esc(h.accreditation||h.category||'—')} &nbsp;·&nbsp; ${esc(h.city||h.tier||'—')} &nbsp;·&nbsp; ${esc(h.address||'—')} &nbsp;<span class="text-muted">(${c.data.match_score}% match)</span></div>
+        ${sourceLine}
       </div>`;
     }
     const needsOverride = c.result==='FAIL' || c.result==='CONDITIONAL';

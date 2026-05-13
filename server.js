@@ -13,6 +13,20 @@ const PORT = process.env.PORT || 3000;
 const RATES = JSON.parse(fs.readFileSync(path.join(__dirname, 'data', 'cghs_rates.json'), 'utf8'));
 const RATES_OLD = JSON.parse(fs.readFileSync(path.join(__dirname, 'data', 'cghs_rates_old_2024.json'), 'utf8'));
 const HOSPITALS = JSON.parse(fs.readFileSync(path.join(__dirname, 'data', 'empanelled_hospitals.json'), 'utf8'));
+let FACILITIES_NATIONAL = [];
+try {
+  FACILITIES_NATIONAL = JSON.parse(fs.readFileSync(path.join(__dirname, 'data', 'cghs_facilities_national.json'), 'utf8'));
+} catch (e) {
+  console.warn('National facilities list not found — proceeding with Delhi/HQ list only.');
+}
+
+// Strip non-numeric prefix from CGHS codes like "C-1591", "S-345", "P 234" → "1591", "345", "234"
+function stripCodePrefix(code) {
+  if (code == null) return null;
+  const s = String(code).trim();
+  const m = s.match(/(\d+)/);
+  return m ? m[1] : null;
+}
 
 // Build a normalized-description → old-rate index for fuzzy matching
 function normDesc(s) {
@@ -589,13 +603,25 @@ function check3_RateCompliance(c) {
   for (const b of c.bills) {
     if (b && Array.isArray(b.line_items)) {
       for (const li of b.line_items) {
-        sources.push({ description: li.description, cghs_code: li.cghs_code, amount: Number(li.amount || 0) });
+        sources.push({
+          description: li.description,
+          cghs_code: li.cghs_code,
+          amount: Number(li.amount || 0),
+          manual_code_2024: li.manual_code_2024 || null,
+          manual_code_2025: li.manual_code_2025 || null
+        });
       }
     }
   }
   if (sources.length === 0 && c.eclaim?.bill_lines) {
     for (const li of c.eclaim.bill_lines) {
-      sources.push({ description: li.treatment_type || 'Item', cghs_code: li.cghs_sr_no, amount: Number(li.amount || 0) });
+      sources.push({
+        description: li.treatment_type || 'Item',
+        cghs_code: li.cghs_sr_no,
+        amount: Number(li.amount || 0),
+        manual_code_2024: li.manual_code_2024 || null,
+        manual_code_2025: li.manual_code_2025 || null
+      });
     }
   }
 
@@ -633,30 +659,51 @@ function check3_RateCompliance(c) {
     const claimed = li.amount;
     total_claimed += claimed;
 
-    // === Lookup in NEW (2025) rate list — by CGHS code ===
-    // === Lookup in NEW (2025) rate list — by CGHS code ===
-    let newEntry = lookupCghsCode(li.cghs_code);
-    let newRate = newEntry ? getApplicableRate(newEntry, tier, accreditation) : null;
-    let newDesc = newEntry?.description || null;
-    let new_match_via = newEntry ? 'code' : null;
+    // Strip prefixes like "C-1591" → "1591" so they hit the 2024 Sr.No. index
+    const rawCode = li.cghs_code != null ? String(li.cghs_code).trim() : '';
+    const numericCode = stripCodePrefix(rawCode);
 
-    // === Lookup in OLD (2024) rate list — Sr No (if numeric) OR by description ===
+    // === Manual override path: dealing hand has picked a specific 2024 Sr No or 2025 code ===
+    let newEntry = null, newRate = null, newDesc = null, new_match_via = null;
     let oldMatch = null;
-    if (li.cghs_code && /^\d+$/.test(String(li.cghs_code).trim())) {
-      const direct = lookupOldRateBySrNo(li.cghs_code);
+
+    if (li.manual_code_2025 && RATES[li.manual_code_2025]) {
+      newEntry = RATES[li.manual_code_2025];
+      newRate = getApplicableRate(newEntry, tier, accreditation);
+      newDesc = newEntry.description;
+      new_match_via = 'manual';
+    }
+    if (li.manual_code_2024 && RATES_OLD[String(li.manual_code_2024)]) {
+      oldMatch = { entry: RATES_OLD[String(li.manual_code_2024)], score: 100, match_type: 'manual' };
+    }
+
+    // === Auto lookup in 2025 list (by code, then description) ===
+    if (!newEntry) {
+      // Try the raw code as-is (e.g., "CN001")
+      newEntry = lookupCghsCode(rawCode);
+      // Then try numeric portion as a fallback (some 2025 codes may also be numeric)
+      if (!newEntry && numericCode) newEntry = lookupCghsCode(numericCode);
+      if (newEntry) {
+        newRate = getApplicableRate(newEntry, tier, accreditation);
+        newDesc = newEntry.description;
+        new_match_via = 'code';
+      }
+    }
+
+    // === Auto lookup in 2024 list (by Sr.No. numeric, then description) ===
+    if (!oldMatch && numericCode) {
+      const direct = lookupOldRateBySrNo(numericCode);
       if (direct) oldMatch = { entry: direct, score: 100, match_type: 'sr_no' };
     }
     if (!oldMatch) {
-      // Try by description — use line description first, then new list's description if available
       oldMatch = lookupOldRateByDescription(li.description)
               || (newDesc ? lookupOldRateByDescription(newDesc) : null);
     }
-    const oldRate = oldMatch ? getOldApplicableRate(oldMatch.entry, accreditation) : null;
     const oldDesc = oldMatch?.entry?.description || null;
+    const oldRate = oldMatch ? getOldApplicableRate(oldMatch.entry, accreditation) : null;
 
-    // === Cross-lookup: if we got 2024 match but no 2025 match, try description-based 2025 lookup ===
+    // === Cross-lookup 2025 by description if still nothing ===
     if (!newEntry && oldDesc) {
-      // Search 2025 rate list by description match (same fuzzy logic)
       const lcDesc = normDesc(oldDesc);
       for (const k in RATES) {
         if (normDesc(RATES[k].description) === lcDesc) {
@@ -669,7 +716,6 @@ function check3_RateCompliance(c) {
       }
     }
     if (!newEntry && li.description) {
-      // Last attempt: fuzzy match line description against 2025 list descriptions
       const lcDesc = normDesc(li.description);
       for (const k in RATES) {
         if (normDesc(RATES[k].description) === lcDesc) {
@@ -682,67 +728,62 @@ function check3_RateCompliance(c) {
       }
     }
 
-    // === Determine admissible by both lists ===
-    let admissible_new, admissible_old;
-    let status_new, status_old;
-
-    if (newRate == null) {
-      admissible_new = claimed;
-      status_new = newEntry ? 'no_rate_for_tier' : (li.cghs_code ? 'unlisted' : 'no_code');
-      if (!newEntry && li.cghs_code) unlisted_count++;
-    } else if (claimed > newRate) {
-      admissible_new = newRate;
-      status_new = 'restricted';
-      any_overshoot_new = true;
-    } else {
-      admissible_new = claimed;
-      status_new = 'within_rate';
+    // === Clean status semantics ===
+    // - Rate found and claimed ≤ rate → "Within rate", admissible = claimed
+    // - Rate found and claimed > rate → "Beyond admissible", admissible = rate
+    // - Rate not found → "Needs manual selection", admissible = null
+    function decide(rate) {
+      if (rate == null) return { admissible: null, status: 'needs_manual' };
+      if (claimed > rate) return { admissible: rate, status: 'beyond_admissible' };
+      return { admissible: claimed, status: 'within_rate' };
     }
+    const d2024 = decide(oldRate);
+    const d2025 = decide(newRate);
+    const admissible_old = d2024.admissible;
+    const status_old = d2024.status;
+    const admissible_new = d2025.admissible;
+    const status_new = d2025.status;
 
-    if (oldRate == null) {
-      admissible_old = claimed;
-      status_old = 'unlisted';
-    } else if (claimed > oldRate) {
-      admissible_old = oldRate;
-      status_old = 'restricted';
-      any_overshoot_old = true;
-    } else {
-      admissible_old = claimed;
-      status_old = 'within_rate';
-    }
+    if (status_new === 'beyond_admissible') any_overshoot_new = true;
+    if (status_old === 'beyond_admissible') any_overshoot_old = true;
+    if ((applicable_list === '2024' ? status_old : status_new) === 'needs_manual') unlisted_count++;
 
-    total_admissible_new += admissible_new;
-    total_admissible_old += admissible_old;
+    // Totals — only add when admissible is known; if needs_manual, count as zero pending resolution
+    total_admissible_new += (admissible_new ?? 0);
+    total_admissible_old += (admissible_old ?? 0);
 
-    // Which list is actually applicable for this claim?
+    // Final per applicable list
     const final_admissible = applicable_list === '2024' ? admissible_old : admissible_new;
     const final_status = applicable_list === '2024' ? status_old : status_new;
     const final_source = applicable_list === '2024'
-      ? (oldMatch ? `OM 2024 (Sr.No. ${oldMatch.entry.sr_no}, Page ${oldMatch.entry.page || '—'})` : 'OM 2024 — not found')
-      : (newEntry ? `OM 03-10-2025 (Code ${Object.keys(RATES).find(k=>RATES[k]===newEntry) || li.cghs_code}, via ${new_match_via})` : 'OM 03-10-2025 — not in list');
+      ? (oldMatch ? `OM 2024 (Sr.No. ${oldMatch.entry.sr_no}, Page ${oldMatch.entry.page || '—'}${oldMatch.match_type==='manual' ? ', manual' : ''})` : 'OM 2024 — not matched, manual selection required')
+      : (newEntry ? `OM 03-10-2025 (Code ${Object.keys(RATES).find(k=>RATES[k]===newEntry) || rawCode}, via ${new_match_via})` : 'OM 03-10-2025 — not matched, manual selection required');
 
     lines.push({
       description: li.description,
-      cghs_code: li.cghs_code,
+      cghs_code: rawCode || null,
+      cghs_code_stripped: numericCode,
       matched_new_desc: newDesc,
-      matched_old_desc: oldMatch?.entry?.description || null,
+      matched_new_code: newEntry ? (Object.keys(RATES).find(k=>RATES[k]===newEntry) || null) : null,
+      matched_old_desc: oldDesc,
       matched_old_sr: oldMatch?.entry?.sr_no || null,
       matched_old_page: oldMatch?.entry?.page || null,
       old_match_score: oldMatch?.score || 0,
       old_match_type: oldMatch?.match_type || null,
       claimed,
-      // 2025 rates
+      // 2025
       rate_2025: newRate,
       admissible_2025: admissible_new,
       status_2025: status_new,
-      // 2024 rates
+      // 2024
       rate_2024: oldRate,
       admissible_2024: admissible_old,
       status_2024: status_old,
-      // Final per applicable date
+      // Final
       admissible_final: final_admissible,
       status_final: final_status,
       rate_source_cited: final_source,
+      manually_resolved: !!(li.manual_code_2024 || li.manual_code_2025),
       tier,
       accreditation
     });
@@ -842,6 +883,36 @@ function check4_WardEntitlement(c) {
   };
 }
 
+// Look up against national facilities scrape (cghshospitals.com)
+function lookupHospitalNational(name, city) {
+  if (!name) return null;
+  const normName = normalizeHospName(name);
+  const tokens = normName.split(' ').filter(t => t.length > 2);
+  let best = null;
+  let bestScore = 0;
+  for (const h of FACILITIES_NATIONAL) {
+    const hn = normalizeHospName(h.name);
+    let score = 0;
+    if (hn === normName) score = 100;
+    else if (hn.includes(normName) || normName.includes(hn)) score = 85;
+    else {
+      const hnTokens = new Set(hn.split(' '));
+      const matched = tokens.filter(t => hnTokens.has(t)).length;
+      if (tokens.length > 0) score = (matched / tokens.length) * 75;
+    }
+    if (city) {
+      const hCity = String(h.city || '').toLowerCase();
+      if (hCity === String(city).toLowerCase()) score += 12;
+      else if (hCity.includes(String(city).toLowerCase()) || String(city).toLowerCase().includes(hCity)) score += 6;
+    }
+    if (score > bestScore) {
+      bestScore = score;
+      best = h;
+    }
+  }
+  return bestScore >= 55 ? { hospital: best, score: Math.round(bestScore) } : null;
+}
+
 function check5_HospitalEmpanelment(c) {
   const eclaim = c.eclaim;
   const hospName = eclaim?.hospital_name || c.bills.find(b => b?.hospital_name)?.hospital_name;
@@ -853,42 +924,44 @@ function check5_HospitalEmpanelment(c) {
       name: 'Hospital Empanelment',
       result: 'PENDING',
       finding: 'Hospital name not extracted from any document. Dealing Hand to verify empanelment manually.',
-      om_ref: 'CGHS empanelled HCO list (Delhi/HQ/Directorate/Ministry — current)',
+      om_ref: 'CGHS Empanelled HCO List — Delhi/HQ + National scrape',
+      om_page: null,
+      om_pdf: null,
       om_excerpt: 'Reimbursement is permissible only at CGHS empanelled hospitals/diagnostic centres unless treated under emergency or with valid ex-post-facto approval.',
       source_refs: [],
       data: {}
     };
   }
 
-  // POC scope: Delhi/Chandigarh list only
-  const inScope = !hospCity || /delhi|gurugram|gurgaon|noida|faridabad|ghaziabad|chandigarh|delhi cantt/i.test(hospCity);
+  // Try Delhi/HQ list first (authoritative for HQ-based beneficiaries)
+  const delhiMatch = lookupHospital(hospName, hospCity);
+  // Then try national scrape
+  const nationalMatch = lookupHospitalNational(hospName, hospCity);
 
-  const match = lookupHospital(hospName, hospCity);
-  if (match) {
+  // Pick the best of the two
+  const bestMatch = (delhiMatch && (!nationalMatch || delhiMatch.score >= nationalMatch.score))
+    ? { ...delhiMatch, source_list: 'Delhi/HQ/Directorate/Ministry list', source_label: 'CGHS Delhi/HQ empanelment list' }
+    : (nationalMatch
+        ? { ...nationalMatch, source_list: 'cghshospitals.com national list', source_label: 'CGHS Hospitals (national scrape)', source_url: nationalMatch.hospital.url || null }
+        : null);
+
+  if (bestMatch) {
+    const h = bestMatch.hospital;
+    const lines = [
+      `Hospital **${hospName}** matched against the **${bestMatch.source_list}** (${bestMatch.score}% match).`,
+      `Matched record: ${h.name} · ${h.accreditation || h.category || 'no accreditation listed'} · ${h.city || h.tier || ''} · ${h.address || ''}`
+    ];
     return {
       id: 'CHK-5',
       name: 'Hospital Empanelment',
       result: 'PASS',
-      finding: `Hospital **${hospName}** matched against CGHS empanelment list (${match.score}% match → "${match.hospital.name}", ${match.hospital.accreditation || 'no accreditation listed'}, ${match.hospital.tier}, ${match.hospital.address}).`,
-      om_ref: 'CGHS Empanelled Hospitals — Delhi/HQ/Directorate/Ministry list',
-      om_page: 'Empanelment list (current) — verified against database',
+      finding: lines.join(' '),
+      om_ref: bestMatch.source_label,
+      om_page: bestMatch.source_url ? `Source listing: ${bestMatch.source_url}` : 'Verified against bundled empanelment database',
       om_pdf: null,
-      om_excerpt: 'The hospital is found on the CGHS empanelled list applicable to Delhi/HQ/Directorate/Ministry beneficiaries.',
+      om_excerpt: 'The hospital is found on the CGHS empanelled list. Reimbursement is permissible at empanelled hospitals subject to applicable rates and ward entitlement.',
       source_refs: [{ slot: 'eclaim', label: 'Hospital name in e-Claim' }, { slot: 'hospital_bill', label: 'Hospital letterhead' }],
-      data: { hospital_name: hospName, matched: match.hospital, match_score: match.score }
-    };
-  }
-
-  if (!inScope) {
-    return {
-      id: 'CHK-5',
-      name: 'Hospital Empanelment',
-      result: 'PENDING',
-      finding: `Hospital **${hospName}** is in **${hospCity}** which is outside the POC scope (Delhi/Chandigarh only). Dealing Hand to verify empanelment manually using the state-specific CGHS list.`,
-      om_ref: 'CGHS Empanelled Hospitals (state-wise lists)',
-      om_excerpt: 'Empanelment lists for cities outside Delhi/Chandigarh are maintained by respective CGHS regional offices. POC has only Delhi/HQ list loaded.',
-      source_refs: [{ slot: 'eclaim', label: 'Hospital location' }],
-      data: { hospital_name: hospName, city: hospCity, out_of_scope: true }
+      data: { hospital_name: hospName, matched: h, match_score: bestMatch.score, source_list: bestMatch.source_list, source_url: bestMatch.source_url || null }
     };
   }
 
@@ -896,11 +969,13 @@ function check5_HospitalEmpanelment(c) {
     id: 'CHK-5',
     name: 'Hospital Empanelment',
     result: 'FAIL',
-    finding: `Hospital **${hospName}** could **not** be matched against the CGHS empanelled list. Reimbursement at non-empanelled hospitals requires (a) emergency justification, or (b) ex-post-facto approval of the competent authority.`,
+    finding: `Hospital **${hospName}**${hospCity ? ' in ' + hospCity : ''} could **not** be matched against either the Delhi/HQ empanelment list or the national CGHS hospitals list (cghshospitals.com). Reimbursement at non-empanelled hospitals requires (a) emergency justification or (b) ex-post-facto approval of the competent authority.`,
     om_ref: 'OM No. 1967/2013/DEL/CGHS/SZ/D52/CGHS(P) dated 30-12-2015',
+    om_page: 'Para 3 — Prior permission requirement for non-empanelled facilities',
+    om_pdf: null,
     om_excerpt: 'In case of serving beneficiaries, prior permission must be obtained for elective treatment/investigations taken at non-empanelled hospitals/diagnostic centres. Ex-post-facto approval from the Competent Authority is required where prior permission could not be obtained due to genuine emergency.',
     source_refs: [{ slot: 'eclaim', label: 'Hospital name & address' }],
-    data: { hospital_name: hospName, city: hospCity, matched: false }
+    data: { hospital_name: hospName, city: hospCity, matched: false, searched_lists: ['Delhi/HQ', 'National scrape'] }
   };
 }
 
@@ -911,13 +986,16 @@ function check6_ListedProcedure(c) {
   for (const b of c.bills) {
     if (b && Array.isArray(b.line_items)) {
       for (const li of b.line_items) {
-        // Try 2025 list by code
-        let in2025 = !!lookupCghsCode(li.cghs_code);
-        // Try 2024 list by Sr No (numeric code)
+        const rawCode = li.cghs_code != null ? String(li.cghs_code).trim() : '';
+        const numericCode = stripCodePrefix(rawCode);
+        // Try 2025 list by code (as-is, then numeric portion)
+        let in2025 = !!lookupCghsCode(rawCode);
+        if (!in2025 && numericCode) in2025 = !!lookupCghsCode(numericCode);
+        // Try 2024 list by Sr No (numeric portion)
         let in2024 = false;
         let oldSr = null;
-        if (li.cghs_code && /^\d+$/.test(String(li.cghs_code).trim())) {
-          const direct = lookupOldRateBySrNo(li.cghs_code);
+        if (numericCode) {
+          const direct = lookupOldRateBySrNo(numericCode);
           if (direct) { in2024 = true; oldSr = direct.sr_no; }
         }
         // Try by description in old list
@@ -1387,15 +1465,65 @@ app.get('/checks', (req, res) => res.sendFile(path.join(__dirname, 'public', 'ch
 app.get('/noting', (req, res) => res.sendFile(path.join(__dirname, 'public', 'noting.html')));
 
 // Health
+// Search rates list (for manual code picker)
+app.get('/api/rates/search', requireAuth, (req, res) => {
+  const q = String(req.query.q || '').toLowerCase().trim();
+  const list = String(req.query.list || 'both'); // '2024' | '2025' | 'both'
+  if (q.length < 2) return res.json({ results: [] });
+
+  const results = [];
+  if (list === '2024' || list === 'both') {
+    for (const k in RATES_OLD) {
+      const e = RATES_OLD[k];
+      if (
+        k.toLowerCase() === q ||
+        String(e.description || '').toLowerCase().includes(q)
+      ) {
+        results.push({
+          list: '2024',
+          code: k,
+          sr_no: e.sr_no,
+          description: e.description,
+          non_nabh: e.non_nabh,
+          nabh: e.nabh,
+          page: e.page
+        });
+        if (results.length >= 40) break;
+      }
+    }
+  }
+  if (list === '2025' || list === 'both') {
+    for (const k in RATES) {
+      const e = RATES[k];
+      if (
+        k.toLowerCase().includes(q) ||
+        String(e.description || '').toLowerCase().includes(q)
+      ) {
+        results.push({
+          list: '2025',
+          code: k,
+          description: e.description,
+          specialty: e.specialty,
+          rates: e.rates
+        });
+        if (results.length >= 80) break;
+      }
+    }
+  }
+  res.json({ results });
+});
+
 app.get('/api/health', (req, res) => res.json({
   status: 'ok',
   ocr_enabled: !!process.env.ANTHROPIC_API_KEY,
-  rates_loaded: Object.keys(RATES).length,
-  hospitals_loaded: HOSPITALS.length
+  rates_2025_loaded: Object.keys(RATES).length,
+  rates_2024_loaded: Object.keys(RATES_OLD).length,
+  hospitals_delhi_hq: HOSPITALS.length,
+  hospitals_national: FACILITIES_NATIONAL.length
 }));
 
 app.listen(PORT, () => {
   console.log(`CGHS Medical Bill Automation running on http://localhost:${PORT}`);
   console.log(`OCR (Claude Vision): ${process.env.ANTHROPIC_API_KEY ? 'ENABLED' : 'DISABLED — set ANTHROPIC_API_KEY'}`);
-  console.log(`Rates loaded: ${Object.keys(RATES).length}, Hospitals loaded: ${HOSPITALS.length}`);
+  console.log(`Rates: 2025=${Object.keys(RATES).length}, 2024=${Object.keys(RATES_OLD).length} | Hospitals: Delhi/HQ=${HOSPITALS.length}, National=${FACILITIES_NATIONAL.length}`);
 });
