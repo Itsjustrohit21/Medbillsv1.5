@@ -4,7 +4,7 @@
 <meta charset="UTF-8">
 <title>Review & Checks — CGHS Medical Bill Automation</title>
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<link rel="stylesheet" href="/styles.css?v=6">
+<link rel="stylesheet" href="/styles.css?v=7">
 </head>
 <body>
 <div class="app-shell">
@@ -182,18 +182,34 @@ function renderPickerResults(rows) {
 function applyPickedCode(list, code) {
   if (!pickerContext) return;
   const { lineIdx } = pickerContext;
-  // Apply to the extracted bill line so the next /api/checks call picks it up
-  // Find the hospital_bill that contains this line
+  // Walk through all bills (flat or nested in bills[]) to find the line at the given global index
   let runningIdx = 0;
   outer: for (const doc of (extracted.hospital_bill || [])) {
-    const items = doc.fields?.line_items || [];
-    for (let i = 0; i < items.length; i++) {
-      if (runningIdx === lineIdx) {
-        if (list === '2024') items[i].manual_code_2024 = code;
-        else items[i].manual_code_2025 = code;
-        break outer;
+    const f = doc.fields || {};
+    // Nested sub-bills
+    if (Array.isArray(f.bills) && f.bills.length > 0) {
+      for (const sub of f.bills) {
+        const items = sub.line_items || [];
+        for (let i = 0; i < items.length; i++) {
+          if (runningIdx === lineIdx) {
+            if (list === '2024') items[i].manual_code_2024 = code;
+            else items[i].manual_code_2025 = code;
+            break outer;
+          }
+          runningIdx++;
+        }
       }
-      runningIdx++;
+    } else {
+      // Flat
+      const items = f.line_items || [];
+      for (let i = 0; i < items.length; i++) {
+        if (runningIdx === lineIdx) {
+          if (list === '2024') items[i].manual_code_2024 = code;
+          else items[i].manual_code_2025 = code;
+          break outer;
+        }
+        runningIdx++;
+      }
     }
   }
   closeCodePicker();
@@ -265,19 +281,42 @@ function buildExtractedView() {
       const confCls = conf==='high'?'conf-high':conf==='low'?'conf-low':'conf-medium';
       const card = document.createElement('div');
       card.className = 'card';
-      const skip = new Set(['_error','_confidence','bill_lines','line_items','procedures_referred','supporting_documents']);
+      const skip = new Set(['_error','_confidence','bill_lines','line_items','procedures_referred','supporting_documents','bills']);
       let body = '';
       if (doc.fields?._error) body += `<div class="tile-validation val-fail" style="margin-bottom:10px;">⚠️ Extraction issue: ${esc(doc.fields._error)}</div>`;
-      body += `<div class="fields-grid" data-slot="${slot}" data-idx="${i}">`;
       const f = doc.fields || {};
-      for (const [k,v] of Object.entries(f)) {
-        if (skip.has(k) || (v && typeof v==='object')) continue;
-        body += `<div class="field-row"><label>${esc(prettyKey(k))}</label><input type="text" data-key="${esc(k)}" value="${esc(v??'')}"></div>`;
+
+      // Hospital bill with multiple sub-bills inside one PDF
+      if (slot === 'hospital_bill' && Array.isArray(f.bills) && f.bills.length > 0) {
+        body += `<div class="text-small text-muted mb-12">This PDF contains <b>${f.bills.length} sub-bill(s)</b>. Each is editable independently.</div>`;
+        f.bills.forEach((sub, sIdx) => {
+          body += `<div class="card" style="background:var(--grey-50);box-shadow:none;border:1px solid var(--grey-200);">
+            <div class="card-title" style="display:flex;justify-content:space-between;align-items:center;">
+              <span>📑 Sub-bill ${sIdx+1}${sub.bill_no ? ` — Bill No. ${esc(sub.bill_no)}` : ''}${sub.bill_date ? ` (${esc(sub.bill_date)})` : ''}</span>
+              <span class="text-small text-muted">Total: ₹${Number(sub.total_amount||0).toLocaleString('en-IN')}</span>
+            </div>
+            <div class="fields-grid" data-slot="${slot}" data-idx="${i}" data-subidx="${sIdx}">`;
+          for (const [k,v] of Object.entries(sub || {})) {
+            if (k === 'line_items' || (v && typeof v === 'object')) continue;
+            body += `<div class="field-row"><label>${esc(prettyKey(k))}</label><input type="text" data-key="${esc(k)}" value="${esc(v??'')}"></div>`;
+          }
+          body += '</div>';
+          if (Array.isArray(sub.line_items) && sub.line_items.length > 0) {
+            body += buildSubTableNested(sub.line_items, slot, i, sIdx, 'line_items', ['description','cghs_code','qty','rate','amount']);
+          }
+          body += '</div>';
+        });
+      } else {
+        // Single object — render flat
+        body += `<div class="fields-grid" data-slot="${slot}" data-idx="${i}">`;
+        for (const [k,v] of Object.entries(f)) {
+          if (skip.has(k) || (v && typeof v==='object')) continue;
+          body += `<div class="field-row"><label>${esc(prettyKey(k))}</label><input type="text" data-key="${esc(k)}" value="${esc(v??'')}"></div>`;
+        }
+        body += '</div>';
+        if (Array.isArray(f.bill_lines) && f.bill_lines.length) body += buildSubTable(f.bill_lines, slot, i, 'bill_lines', ['treatment_type','from_date','to_date','amount','cghs_sr_no','cash_memo_no']);
+        if (Array.isArray(f.line_items) && f.line_items.length) body += buildSubTable(f.line_items, slot, i, 'line_items', ['description','cghs_code','qty','rate','amount']);
       }
-      body += '</div>';
-      // Array sub-tables
-      if (Array.isArray(f.bill_lines) && f.bill_lines.length) body += buildSubTable(f.bill_lines, slot, i, 'bill_lines', ['treatment_type','from_date','to_date','amount','cghs_sr_no','cash_memo_no']);
-      if (Array.isArray(f.line_items) && f.line_items.length) body += buildSubTable(f.line_items, slot, i, 'line_items', ['description','cghs_code','qty','rate','amount']);
       if (Array.isArray(f.procedures_referred) && f.procedures_referred.length) body += buildSubTable(f.procedures_referred, slot, i, 'procedures_referred', ['name','cghs_code']);
       card.innerHTML = `
         <div class="check-head">
@@ -295,6 +334,18 @@ function buildExtractedView() {
   document.getElementById('extractedInfo').textContent = `${total} document(s) processed. Edit any field before running checks.`;
 }
 
+function buildSubTableNested(arr, slot, idx, subidx, listKey, cols) {
+  let html = `<div class="card-title mt-12">${prettyKey(listKey)}</div>
+    <div style="overflow-x:auto;">
+    <table class="bill-table" data-slot="${slot}" data-idx="${idx}" data-subidx="${subidx}" data-list="${listKey}">
+      <thead><tr>${cols.map(c=>`<th>${esc(prettyKey(c))}</th>`).join('')}</tr></thead><tbody>`;
+  arr.forEach((r,ri) => {
+    html += '<tr>'+cols.map(c=>`<td><input style="width:100%;border:1px solid #c8d0d9;border-radius:4px;padding:3px 5px;font-size:11.5px;" data-row="${ri}" data-col="${esc(c)}" value="${esc(r&&r[c]!=null?r[c]:'')}" /></td>`).join('')+'</tr>';
+  });
+  html += '</tbody></table></div>';
+  return html;
+}
+
 function buildSubTable(arr, slot, idx, listKey, cols) {
   let html = `<div class="card-title mt-12">${prettyKey(listKey)}</div>
     <div style="overflow-x:auto;">
@@ -310,7 +361,13 @@ function buildSubTable(arr, slot, idx, listKey, cols) {
 function collectEdits() {
   document.querySelectorAll('.fields-grid').forEach(g => {
     const slot=g.dataset.slot, idx=parseInt(g.dataset.idx);
-    const target = extracted[slot]?.[idx]?.fields;
+    const subidx = g.dataset.subidx != null ? parseInt(g.dataset.subidx) : null;
+    let target;
+    if (subidx != null) {
+      target = extracted[slot]?.[idx]?.fields?.bills?.[subidx];
+    } else {
+      target = extracted[slot]?.[idx]?.fields;
+    }
     if (!target) return;
     g.querySelectorAll('input').forEach(inp => {
       const k=inp.dataset.key; if (!k) return;
@@ -320,7 +377,13 @@ function collectEdits() {
   });
   document.querySelectorAll('.bill-table[data-list]').forEach(tbl => {
     const slot=tbl.dataset.slot, idx=parseInt(tbl.dataset.idx), listKey=tbl.dataset.list;
-    const arr = extracted[slot]?.[idx]?.fields?.[listKey];
+    const subidx = tbl.dataset.subidx != null ? parseInt(tbl.dataset.subidx) : null;
+    let arr;
+    if (subidx != null) {
+      arr = extracted[slot]?.[idx]?.fields?.bills?.[subidx]?.[listKey];
+    } else {
+      arr = extracted[slot]?.[idx]?.fields?.[listKey];
+    }
     if (!Array.isArray(arr)) return;
     tbl.querySelectorAll('tbody tr').forEach((tr,ri) => {
       tr.querySelectorAll('input').forEach(inp => {
@@ -469,6 +532,40 @@ function renderChecks() {
         <div style="font-size:12.5px;margin-top:4px;">${esc(h.name)} &nbsp;·&nbsp; ${esc(h.accreditation||h.category||'—')} &nbsp;·&nbsp; ${esc(h.city||h.tier||'—')} &nbsp;·&nbsp; ${esc(h.address||'—')} &nbsp;<span class="text-muted">(${c.data.match_score}% match)</span></div>
         ${sourceLine}
       </div>`;
+    }
+
+    // CHK-2: per-bill breakdown table
+    if (c.id==='CHK-2' && c.data?.bills && c.data.bills.length > 0) {
+      extra += `<div class="card-title mt-12" style="margin-bottom:6px;">Per-bill breakdown</div>
+        <div style="overflow-x:auto;"><table class="bill-table">
+          <thead><tr>
+            <th>#</th><th>Bill No.</th><th>Bill Date</th><th>Source File</th>
+            <th class="text-right">Stated Total (₹)</th>
+            <th class="text-right">Sum of Line Items (₹)</th>
+            <th class="text-right">Effective Total (₹)</th>
+          </tr></thead><tbody>`;
+      for (const b of c.data.bills) {
+        const fallbackBadge = b.used_linesum_fallback ? ' <span class="badge badge-cond" style="font-size:9px;">used line sum</span>' : '';
+        extra += `<tr>
+          <td>${b.idx}</td>
+          <td>${esc(b.bill_no||'—')}</td>
+          <td>${esc(b.bill_date||'—')}</td>
+          <td class="text-small text-muted">${esc(b.source_file||'—')}</td>
+          <td class="text-right">₹${Number(b.stated_total).toLocaleString('en-IN')}</td>
+          <td class="text-right">₹${Number(b.linesum).toLocaleString('en-IN')}</td>
+          <td class="text-right"><strong>₹${Number(b.effective_total).toLocaleString('en-IN')}</strong>${fallbackBadge}</td>
+        </tr>`;
+      }
+      extra += `</tbody><tfoot><tr style="background:#e6f0ff;font-weight:700;">
+        <td colspan="6" class="text-right">Sum of bills</td>
+        <td class="text-right">₹${Number(c.data.bills_sum).toLocaleString('en-IN')}</td>
+      </tr><tr style="background:#e6f0ff;font-weight:700;">
+        <td colspan="6" class="text-right">e-Claim total</td>
+        <td class="text-right">₹${Number(c.data.eclaim_total).toLocaleString('en-IN')}</td>
+      </tr>${c.data.difference !== 0 ? `<tr style="background:#fff7e6;font-weight:700;">
+        <td colspan="6" class="text-right">Difference</td>
+        <td class="text-right" style="color:var(--fail);">₹${Math.abs(c.data.difference).toLocaleString('en-IN')} ${c.data.difference > 0 ? '(bills less than e-Claim)' : '(bills more than e-Claim)'}</td>
+      </tr>` : ''}</tfoot></table></div>`;
     }
     const needsOverride = c.result==='FAIL' || c.result==='CONDITIONAL';
     const overrideHtml = needsOverride ? `<div class="check-override">

@@ -399,23 +399,34 @@ Use null for missing values, not "N/A".`,
   "remarks": "..."
 }`,
 
-  hospital_bill: `Extract from this hospital bill / cash memo / invoice. Return ONLY this JSON:
+  hospital_bill: `This document may contain ONE OR MORE hospital bills/cash memos/invoices on different pages or sections (e.g., the patient may have a separate consultation bill and a separate investigations bill from the same hospital). Identify EACH distinct bill — they typically have separate Bill No., Date, or are clearly different cash memos — and return them as separate objects in a "bills" array. Do NOT merge them; do NOT sum them; do NOT skip any. If the document is a single bill, the array will have one element.
+
+Return ONLY this JSON:
 {
-  "hospital_name": "...",
-  "hospital_address": "...",
-  "city": "...",
-  "patient_name": "...",
-  "bill_no": "...",
-  "bill_date": "DD-MM-YYYY",
-  "admission_date": "DD-MM-YYYY or null if not IPD",
-  "discharge_date": "DD-MM-YYYY or null",
-  "is_ipd": true | false,
-  "ward_category": "General | Semi-Private | Private | ICU | NICU | null",
-  "line_items": [
-    { "description": "...", "cghs_code": "if mentioned", "qty": <number>, "rate": <number>, "amount": <number> }
-  ],
-  "total_amount": <number>
-}`,
+  "bills": [
+    {
+      "hospital_name": "...",
+      "hospital_address": "...",
+      "city": "...",
+      "patient_name": "...",
+      "bill_no": "...",
+      "bill_date": "DD-MM-YYYY",
+      "admission_date": "DD-MM-YYYY or null if not IPD",
+      "discharge_date": "DD-MM-YYYY or null",
+      "is_ipd": true | false,
+      "ward_category": "General | Semi-Private | Private | ICU | NICU | null",
+      "line_items": [
+        { "description": "...", "cghs_code": "if mentioned", "qty": <number>, "rate": <number>, "amount": <number> }
+      ],
+      "total_amount": <number>
+    }
+  ]
+}
+
+CRITICAL:
+- If 1 PDF contains 3 separate bills (e.g., consultation ₹350, investigations ₹2,527, and pharmacy ₹500), return 3 objects in "bills".
+- total_amount for each bill must match the sum of its own line_items (round to the nearest rupee).
+- Each line_item in a bill must belong to THAT bill, not other bills in the same document.`,
 
   cghs_card: `Extract from this CGHS Beneficiary Card. Return ONLY this JSON:
 {
@@ -503,11 +514,34 @@ app.post('/api/extract', requireAuth, async (req, res) => {
 
 // ---------- The 8 Checks ----------
 function consolidateExtraction(extracted) {
+  // Flatten hospital_bill: each uploaded PDF may now return { bills: [...] } with multiple sub-bills.
+  // Backward-compat: also accept legacy flat shape with top-level total_amount/line_items.
+  const bills = [];
+  for (const b of (extracted.hospital_bill || [])) {
+    const f = b?.fields;
+    if (!f) continue;
+    if (Array.isArray(f.bills) && f.bills.length > 0) {
+      // New schema — multiple sub-bills per PDF
+      for (const sub of f.bills) {
+        if (sub && typeof sub === 'object') {
+          // Tag with source file info so the dealing hand sees which PDF it came from
+          bills.push({ ...sub, _source_file_id: b.file_id, _source_filename: b.filename });
+        }
+      }
+    } else if (f.total_amount != null || (Array.isArray(f.line_items) && f.line_items.length > 0)) {
+      // Legacy / single-bill schema — keep as-is
+      bills.push({ ...f, _source_file_id: b.file_id, _source_filename: b.filename });
+    } else if (Object.keys(f).length > 0) {
+      // Unknown shape but has data — include it
+      bills.push({ ...f, _source_file_id: b.file_id, _source_filename: b.filename });
+    }
+  }
+
   const out = {
     eclaim: extracted.eclaim?.[0]?.fields || null,
     referral: extracted.referral?.[0]?.fields || null,
     cghs_card: extracted.cghs_card?.[0]?.fields || null,
-    bills: (extracted.hospital_bill || []).map(b => b.fields).filter(Boolean),
+    bills,
     payment: extracted.payment_proof?.[0]?.fields || null
   };
   return out;
@@ -567,25 +601,55 @@ function check1_TypeOfClaim(c) {
 
 function check2_BillReconciliation(c) {
   const eclaim_total = Number(c.eclaim?.total_amount_claimed || 0);
-  const bills_sum = c.bills.reduce((s, b) => s + Number(b?.total_amount || 0), 0);
+
+  // Per-bill breakdown — use stated total_amount; fall back to sum of line_items if total looks wrong/missing
+  const billBreakdown = c.bills.map((b, idx) => {
+    const stated = Number(b?.total_amount || 0);
+    const linesum = Array.isArray(b?.line_items)
+      ? b.line_items.reduce((s, li) => s + Number(li?.amount || 0), 0)
+      : 0;
+    // Trust line items when stated total is missing OR clearly inconsistent with line items
+    const useLineSum = stated === 0 || (linesum > 0 && Math.abs(stated - linesum) > 1);
+    const effective = useLineSum && linesum > 0 ? linesum : stated;
+    return {
+      idx: idx + 1,
+      bill_no: b?.bill_no || null,
+      bill_date: b?.bill_date || null,
+      source_file: b?._source_filename || null,
+      stated_total: stated,
+      linesum,
+      effective_total: effective,
+      used_linesum_fallback: useLineSum && linesum > 0
+    };
+  });
+
+  const bills_sum = billBreakdown.reduce((s, b) => s + b.effective_total, 0);
   const diff = Math.round((eclaim_total - bills_sum) * 100) / 100;
-  const passed = Math.abs(diff) === 0 || (eclaim_total === 0 && bills_sum === 0);
   const bothZero = eclaim_total === 0 && bills_sum === 0;
+  const passed = !bothZero && Math.abs(diff) <= 1; // ±₹1 rounding tolerance only
+
+  let finding;
+  if (bothZero) {
+    finding = 'No amounts extracted. Upload the e-Claim and hospital bills to enable reconciliation.';
+  } else if (passed) {
+    finding = `e-Claim total (₹${eclaim_total.toLocaleString('en-IN')}) reconciles with the sum of **${billBreakdown.length} bill(s)** = ₹${bills_sum.toLocaleString('en-IN')}.`;
+    const fallbackCount = billBreakdown.filter(b => b.used_linesum_fallback).length;
+    if (fallbackCount > 0) finding += ` (${fallbackCount} bill total derived from itemised line totals where the stated total was missing or inconsistent.)`;
+  } else {
+    finding = `Discrepancy of ₹${Math.abs(diff).toLocaleString('en-IN')} between e-Claim total (₹${eclaim_total.toLocaleString('en-IN')}) and sum of **${billBreakdown.length} bill(s)** (₹${bills_sum.toLocaleString('en-IN')}). ${diff > 0 ? 'Bills under-reported — a bill may be missing from the upload or an OCR extraction missed a sub-bill.' : 'Bills over-reported — possible duplicate or OCR double-counting.'} Review the per-bill breakdown below.`;
+  }
+
   return {
     id: 'CHK-2',
     name: 'Bill Amount Reconciliation',
     result: bothZero ? 'PENDING' : passed ? 'PASS' : 'CONDITIONAL',
-    finding: bothZero
-      ? 'No amounts extracted. Upload the e-Claim and hospital bills to enable reconciliation.'
-      : passed
-        ? `e-Claim total (₹${eclaim_total.toLocaleString('en-IN')}) exactly matches sum of uploaded bill amounts (₹${bills_sum.toLocaleString('en-IN')}).`
-        : `Discrepancy of ₹${Math.abs(diff).toLocaleString('en-IN')} between e-Claim total (₹${eclaim_total.toLocaleString('en-IN')}) and sum of uploaded bills (₹${bills_sum.toLocaleString('en-IN')}). ${diff > 0 ? 'Bills under-reported — verify missing bills.' : 'Bills over-reported — verify if duplicate bills uploaded.'}`,
+    finding,
     om_ref: 'Structural — Internal Claim Reconciliation',
-    om_excerpt: 'The total amount claimed in the GIFMIS/PFMS e-Claim form must exactly match the aggregate of individual cash memos and bills attached. Any variance must be explained with a noting.',
+    om_excerpt: 'The total amount claimed in the GIFMIS/PFMS e-Claim form must exactly match the aggregate of individual cash memos and bills attached. When a single uploaded PDF contains multiple cash memos (e.g., a consultation bill plus a separate investigations bill), each sub-bill must be counted independently. Where a stated bill total appears inconsistent with its line items, the sum of line items is used as the effective amount.',
     om_page: null,
     om_pdf: null,
     source_refs: [{ slot: 'eclaim', label: 'Total claimed field' }, { slot: 'hospital_bill', label: 'Individual bill totals' }],
-    data: { eclaim_total, bills_sum, difference: diff }
+    data: { eclaim_total, bills_sum, difference: diff, bill_count: billBreakdown.length, bills: billBreakdown }
   };
 }
 
